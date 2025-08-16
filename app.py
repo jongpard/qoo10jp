@@ -413,6 +413,46 @@ def translate_ja_to_ko_batch(lines: List[str]) -> List[str]:
     return out
 
 
+    # 2) 일본어 구간만 배치 번역 (googletrans → deep-translator 폴백)
+    def _translate_batch(src_list: List[str]) -> List[str]:
+        # googletrans
+        try:
+            from googletrans import Translator
+            tr = Translator(service_urls=['translate.googleapis.com'])
+            res = tr.translate(src_list, src="ja", dest="ko")
+            return [r.text for r in (res if isinstance(res, list) else [res])]
+        except Exception as e1:
+            print("[Translate] googletrans 실패:", e1)
+        # deep-translator
+        try:
+            from deep_translator import GoogleTranslator as DT
+            gt = DT(source='ja', target='ko')
+            return [gt.translate(t) if t else "" for t in src_list]
+        except Exception as e2:
+            print("[Translate] deep-translator 실패:", e2)
+            return ["" for _ in src_list]
+
+    ja_translated = _translate_batch(ja_pool)
+
+    # 3) 세그먼트 조립: raw는 그대로, ja는 번역 텍스트로 치환
+    out: List[str] = []
+    it = iter(ja_translated)
+    for parts in seg_lists:
+        if parts is None:
+            out.append("")  # 번역 줄 없음
+            continue
+        buf = []
+        for kind, txt in parts:
+            if kind == "raw":
+                buf.append(txt)
+            else:  # 'ja'
+                buf.append(next(it, ""))
+        out.append("".join(buf))
+
+    print(f"[Translate] done with JA-only preserve: {sum(1 for x in out if x)} lines")
+    return out
+
+
 # ---------- compare/message ----------
 def to_dataframe(products: List[Product], date_str: str) -> pd.DataFrame:
     return pd.DataFrame([{
