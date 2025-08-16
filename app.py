@@ -336,46 +336,82 @@ def slack_post(text: str):
         print("[Slack 실패]", r.status_code, r.text)
 
 def translate_ja_to_ko_batch(lines: List[str]) -> List[str]:
-    """일본어가 포함된 라인만 번역해 반환(그 외는 빈 문자열). googletrans → deep-translator 순으로 시도."""
+    """
+    JA 구간만 번역하고, 나머지(영어/숫자/기호)는 그대로 둔다.
+    일본어가 전혀 없으면 번역 줄을 붙이지 않는다(빈 문자열 반환).
+    """
     flag = os.getenv("SLACK_TRANSLATE_JA2KO", "0").lower() in ("1","true","yes")
     texts = [(l or "").strip() for l in lines]
     if not flag or not texts:
         print("[Translate] OFF")
         return ["" for _ in texts]
 
-    # 일본어 포함 라인만 추출
-    idx_map = [(i, t) for i, t in enumerate(texts) if contains_japanese(t)]
-    if not idx_map:
+    # 1) 라인별로 [("raw",text)/("ja",text)] 세그먼트로 분해
+    seg_lists: List[Optional[List[Tuple[str, str]]]] = []
+    ja_pool: List[str] = []
+    ja_run = re.compile(r"[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]+")  # 일본어 연속 구간
+
+    for line in texts:
+        if not contains_japanese(line):
+            seg_lists.append(None)  # 이 라인은 번역하지 않음(빈 줄)
+            continue
+        parts: List[Tuple[str, str]] = []
+        last = 0
+        for m in ja_run.finditer(line):
+            if m.start() > last:
+                parts.append(("raw", line[last:m.start()]))  # 영어/숫자/기호 등
+            parts.append(("ja", line[m.start():m.end()]))     # 일본어 구간
+            last = m.end()
+        if last < len(line):
+            parts.append(("raw", line[last:]))
+
+        seg_lists.append(parts)
+        for kind, txt in parts:
+            if kind == "ja":
+                ja_pool.append(txt)
+
+    if not ja_pool:
         return ["" for _ in texts]
 
-    src = [t for _, t in idx_map]
-    out_all = [""] * len(texts)
+    # 2) 일본어 구간만 배치 번역 (googletrans → deep-translator 폴백)
+    def _translate_batch(src_list: List[str]) -> List[str]:
+        # googletrans
+        try:
+            from googletrans import Translator
+            tr = Translator(service_urls=['translate.googleapis.com'])
+            res = tr.translate(src_list, src="ja", dest="ko")
+            return [r.text for r in (res if isinstance(res, list) else [res])]
+        except Exception as e1:
+            print("[Translate] googletrans 실패:", e1)
+        # deep-translator
+        try:
+            from deep_translator import GoogleTranslator as DT
+            gt = DT(source='ja', target='ko')
+            return [gt.translate(t) if t else "" for t in src_list]
+        except Exception as e2:
+            print("[Translate] deep-translator 실패:", e2)
+            return ["" for _ in src_list]
 
-    # 1차: googletrans
-    try:
-        from googletrans import Translator
-        tr = Translator(service_urls=['translate.googleapis.com'])
-        res = tr.translate(src, src="ja", dest="ko")
-        out = [r.text for r in (res if isinstance(res, list) else [res])]
-        for (i, _), tr_txt in zip(idx_map, out):
-            out_all[i] = tr_txt
-        print(f"[Translate] OK via googletrans: {len(out)} lines")
-        return out_all
-    except Exception as e1:
-        print("[Translate] googletrans 실패:", e1)
+    ja_translated = _translate_batch(ja_pool)
 
-    # 2차: deep-translator fallback
-    try:
-        from deep_translator import GoogleTranslator as DT
-        gt = DT(source='ja', target='ko')
-        out = [gt.translate(t) if t else "" for t in src]
-        for (i, _), tr_txt in zip(idx_map, out):
-            out_all[i] = tr_txt
-        print(f"[Translate] OK via deep-translator: {len(out)} lines")
-        return out_all
-    except Exception as e2:
-        print("[Translate] deep-translator 실패:", e2)
-        return out_all
+    # 3) 세그먼트 조립: raw는 그대로, ja는 번역 텍스트로 치환
+    out: List[str] = []
+    it = iter(ja_translated)
+    for parts in seg_lists:
+        if parts is None:
+            out.append("")  # 번역 줄 없음
+            continue
+        buf = []
+        for kind, txt in parts:
+            if kind == "raw":
+                buf.append(txt)
+            else:  # 'ja'
+                buf.append(next(it, ""))
+        out.append("".join(buf))
+
+    print(f"[Translate] done with JA-only preserve: {sum(1 for x in out if x)} lines")
+    return out
+
 
 # ---------- compare/message ----------
 def to_dataframe(products: List[Product], date_str: str) -> pd.DataFrame:
