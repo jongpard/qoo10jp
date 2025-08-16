@@ -330,23 +330,36 @@ def slack_post(text: str):
 
 def translate_ja_to_ko_batch(lines: List[str]) -> List[str]:
     flag = os.getenv("SLACK_TRANSLATE_JA2KO", "0").lower() in ("1","true","yes")
-    if not flag or not lines:
+    texts = [ (l or "").strip() for l in lines ]
+    if not flag or not texts:
         print("[Translate] OFF")
-        return ["" for _ in lines]
+        return ["" for _ in texts]
+
+    # 1차: googletrans
     try:
         from googletrans import Translator
-        # github actions 환경에서 더 안정적인 엔드포인트
         tr = Translator(service_urls=['translate.googleapis.com'])
-        res = tr.translate(lines, src="ja", dest="ko")
+        res = tr.translate(texts, src="ja", dest="ko")
         if isinstance(res, list):
             out = [r.text for r in res]
         else:
             out = [res.text]
-        print(f"[Translate] OK {len(lines)} lines")
+        print(f"[Translate] OK via googletrans: {len(out)} lines")
         return out
-    except Exception as e:
-        print("[Translate] 실패:", e)
-        return ["" for _ in lines]
+    except Exception as e1:
+        print("[Translate] googletrans 실패:", e1)
+
+    # 2차: deep-translator (fallback)
+    try:
+        from deep_translator import GoogleTranslator as DT
+        gt = DT(source='ja', target='ko')
+        out = [gt.translate(t) if t else "" for t in texts]
+        print(f"[Translate] OK via deep-translator: {len(out)} lines")
+        return out
+    except Exception as e2:
+        print("[Translate] deep-translator 실패:", e2)
+        return ["" for _ in texts]
+
 
 # ----- compare/message -----
 def to_dataframe(products: List[Product], date_str: str) -> pd.DataFrame:
