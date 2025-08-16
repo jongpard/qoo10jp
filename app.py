@@ -44,6 +44,11 @@ def slack_escape(s): return s.replace("&","&amp;").replace("<","&lt;").replace("
 OFFICIAL_PAT = re.compile(r"^\s*(公式|公式ショップ|公式ストア)\s*", re.I)
 BRACKETS_PAT = re.compile(r"(\[.*?\]|【.*?】|（.*?）|\(.*?\))")
 
+# ----- 일본어 감지 (번역 시 영어-only는 제외)
+JP_CHAR_RE = re.compile(r"[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]")
+def contains_japanese(s: str) -> bool:
+    return bool(JP_CHAR_RE.search(s or ""))
+
 def remove_official_token(s: str) -> str:
     if not s: return ""
     s = clean_text(s)
@@ -198,7 +203,6 @@ def fetch_by_playwright() -> List[Product]:
         try: page.wait_for_load_state("networkidle", timeout=25_000)
         except: pass
 
-        # 넉넉하게 수집해오고 Python에서 MAX_RANK로 절단
         data = page.evaluate("""
             () => {
               const as = Array.from(document.querySelectorAll("a[href*='Goods.aspx'], a[href*='/Item/'], a[href*='/item/']"));
@@ -210,6 +214,7 @@ def fetch_by_playwright() -> List[Product]:
                 const li = a.closest('li') || a.closest('div');
                 if (!href || !name || !li) continue;
 
+                // 브랜드: 상품 링크가 아닌 첫 a
                 let brand = '';
                 const anchors = Array.from(li.querySelectorAll('a'));
                 for (const b of anchors) {
@@ -224,7 +229,7 @@ def fetch_by_playwright() -> List[Product]:
                 seen.add(key);
                 rows.push({href, name, brand, block});
               }
-              return rows.slice(0, 500);   // 충분히 크게
+              return rows.slice(0, 500);
             }
         """)
         context.close(); browser.close()
@@ -331,36 +336,46 @@ def slack_post(text: str):
         print("[Slack 실패]", r.status_code, r.text)
 
 def translate_ja_to_ko_batch(lines: List[str]) -> List[str]:
+    """일본어가 포함된 라인만 번역해 반환(그 외는 빈 문자열). googletrans → deep-translator 순으로 시도."""
     flag = os.getenv("SLACK_TRANSLATE_JA2KO", "0").lower() in ("1","true","yes")
-    texts = [ (l or "").strip() for l in lines ]
+    texts = [(l or "").strip() for l in lines]
     if not flag or not texts:
         print("[Translate] OFF")
         return ["" for _ in texts]
+
+    # 일본어 포함 라인만 추출
+    idx_map = [(i, t) for i, t in enumerate(texts) if contains_japanese(t)]
+    if not idx_map:
+        return ["" for _ in texts]
+
+    src = [t for _, t in idx_map]
+    out_all = [""] * len(texts)
 
     # 1차: googletrans
     try:
         from googletrans import Translator
         tr = Translator(service_urls=['translate.googleapis.com'])
-        res = tr.translate(texts, src="ja", dest="ko")
-        if isinstance(res, list):
-            out = [r.text for r in res]
-        else:
-            out = [res.text]
+        res = tr.translate(src, src="ja", dest="ko")
+        out = [r.text for r in (res if isinstance(res, list) else [res])]
+        for (i, _), tr_txt in zip(idx_map, out):
+            out_all[i] = tr_txt
         print(f"[Translate] OK via googletrans: {len(out)} lines")
-        return out
+        return out_all
     except Exception as e1:
         print("[Translate] googletrans 실패:", e1)
 
-    # 2차: deep-translator (fallback)
+    # 2차: deep-translator fallback
     try:
         from deep_translator import GoogleTranslator as DT
         gt = DT(source='ja', target='ko')
-        out = [gt.translate(t) if t else "" for t in texts]
+        out = [gt.translate(t) if t else "" for t in src]
+        for (i, _), tr_txt in zip(idx_map, out):
+            out_all[i] = tr_txt
         print(f"[Translate] OK via deep-translator: {len(out)} lines")
-        return out
+        return out_all
     except Exception as e2:
         print("[Translate] deep-translator 실패:", e2)
-        return ["" for _ in texts]
+        return out_all
 
 # ---------- compare/message ----------
 def to_dataframe(products: List[Product], date_str: str) -> pd.DataFrame:
