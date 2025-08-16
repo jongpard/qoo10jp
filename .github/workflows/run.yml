@@ -9,13 +9,11 @@ jobs:
   run:
     runs-on: ubuntu-latest
     env:
-      # === Slack / Google Drive ===
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
       GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
       GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
       GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
       GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-      # === 번역 토글(추가) ===
       SLACK_TRANSLATE_JA2KO: ${{ secrets.SLACK_TRANSLATE_JA2KO }}
 
     steps:
@@ -31,6 +29,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      # ⬇️ Playwright 브라우저 & 시스템 의존성 설치 (필수)
+      - name: Install Playwright browsers
+        run: |
+          python -m playwright install --with-deps chromium
 
       - name: Run python app.py
         run: |
