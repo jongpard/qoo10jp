@@ -3,7 +3,7 @@ name: Qoo10 JP Beauty Ranking
 on:
   workflow_dispatch:
   schedule:
-    - cron: "10 0 * * *"   # KST 09:10
+    - cron: "0 4 * * *"   # KST 13:00
 
 jobs:
   run:
