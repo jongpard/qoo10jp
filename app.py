@@ -2,9 +2,14 @@
 """
 Qoo10 JP Beauty Bestsellers (g=2)
 - 1차: 모바일 베스트셀러 정적 HTML
-- 실패 시: 데스크톱 페이지 Playwright 폴백
+- 실패 시: 데스크톱 Playwright 폴백
 - CSV: 큐텐재팬_뷰티_랭킹_YYYY-MM-DD.csv (KST)
 - 비교 키: product_code(商品番号) 우선, 없으면 URL
+- 요청 반영:
+  * '公式' 토큰 제거(브랜드/상품명, CSV·Slack 모두)
+  * 가격: '...円'에 붙은 금액만 인식(판매수/리뷰수 숫자 배제), sale=최솟값, orig=최댓값
+  * Slack: 제품명에서 괄호류([]【】()（）) 내용 제거
+  * Slack TOP10: 일본어 줄 아래 한국어 번역(옵션, SLACK_TRANSLATE_JA2KO=1)
 """
 
 import os, re, io, math, pytz, traceback
@@ -32,14 +37,27 @@ def build_filename(d): return f"큐텐재팬_뷰티_랭킹_{d}.csv"
 def clean_text(s): return re.sub(r"\s+", " ", (s or "")).strip()
 def slack_escape(s): return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
+# ----- '公式' 제거 / 괄호 제거 -----
+OFFICIAL_PAT = re.compile(r"^\s*(公式|公式ショップ|公式ストア)\s*", re.I)
+BRACKETS_PAT = re.compile(r"(\[.*?\]|【.*?】|（.*?）|\(.*?\))")
+
+def remove_official_token(s: str) -> str:
+    if not s: return ""
+    s = clean_text(s)
+    s = OFFICIAL_PAT.sub("", s)
+    return s
+
+def strip_brackets_for_slack(s: str) -> str:
+    if not s: return ""
+    return clean_text(BRACKETS_PAT.sub("", s))
+
 # ----- price/discount -----
 YEN_AMOUNT_RE = re.compile(r"(?:¥|)(\d{1,3}(?:,\d{3})+|\d+)\s*円")
 PCT_RE = re.compile(r"(\d+)\s*% ?OFF", re.I)
 
 def parse_jpy_amounts(text: str) -> List[int]:
-    # '円'이 따라붙은 금액만 추출 → 판매수/리뷰수 등 배제
-    vals = [int(m.group(1).replace(",", "")) for m in YEN_AMOUNT_RE.finditer(text or "")]
-    return vals
+    # '円'이 붙은 금액만 추출 → 판매수/리뷰수 숫자 배제
+    return [int(m.group(1).replace(",", "")) for m in YEN_AMOUNT_RE.finditer(text or "")]
 
 def compute_prices(block_text: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
     """return (sale, orig, pct)  / sale=최소, orig=최대, pct=버림"""
@@ -61,7 +79,6 @@ def compute_prices(block_text: str) -> Tuple[Optional[int], Optional[int], Optio
 
 # ----- product code -----
 GOODS_CODE_RE = re.compile(r"(?:[?&](?:goods?_?code|goodsno)=(\d+))", re.I)
-# /item/slug/1091763751 , /Item/1091763751 둘 다 대응
 ITEM_PATH_RE  = re.compile(r"/(?:Item|item)/(?:.*?/)?(\d+)(?:[/?#]|$)")
 
 def extract_goods_code(url: str, block_text: str = "") -> str:
@@ -75,18 +92,17 @@ def extract_goods_code(url: str, block_text: str = "") -> str:
 
 # ----- brand -----
 def bs_pick_brand(container) -> str:
-    """컨테이너 내에서 상품 링크가 아닌 첫 a를 브랜드로 추정"""
+    """컨테이너 내에서 상품 링크가 아닌 첫 a를 브랜드로 추정. '公式'류 제거."""
     if not container: return ""
     for a in container.select("a"):
         href = (a.get("href") or "").lower()
         if ("goods.aspx" in href) or ("/item/" in href) or ("/goods" in href):
             continue
-        t = clean_text(a.get_text(" ", strip=True))
-        if 1 <= len(t) <= 40:
+        t = remove_official_token(a.get_text(" ", strip=True))
+        if 1 <= len(t) <= 40 and t not in ("公式",):
             return t
-    # 텍스트 선두에서 公式 제거 후 첫 토큰
-    txt = clean_text(container.get_text(" ", strip=True))
-    txt = re.sub(r"^\s*公式\s*", "", txt)
+    # fallback: 전체 텍스트 선두에서 '公式' 제거 후 첫 토큰
+    txt = remove_official_token(container.get_text(" ", strip=True))
     m = re.match(r"([^\s\[]{2,})", txt)
     return m.group(1) if m else ""
 
@@ -119,18 +135,18 @@ def parse_mobile_html(html: str) -> List[Product]:
         if href.startswith("//"): href = "https:" + href
         elif href.startswith("/"): href = "https://www.qoo10.jp" + href
 
-        # dedup key (상품코드 우선)
+        # 상품코드/dedup
         code = extract_goods_code(href, block_text)
         key = code or href
         if key in seen: continue
         seen.add(key)
 
         # 이름/브랜드/가격
-        name = clean_text(a.get_text(" ", strip=True))
-        brand = bs_pick_brand(container)
+        name = remove_official_token(a.get_text(" ", strip=True))     # CSV에도 '公式' 제거
+        brand = remove_official_token(bs_pick_brand(container))       # '公式' 제거
         sale, orig, pct = compute_prices(block_text)
 
-        # 랭크는 실제 append 시점의 길이로 연속 부여
+        # 연속 랭크 부여
         items.append(Product(
             rank=len(items)+1, brand=brand, title=name,
             price=sale, orig_price=orig, discount_percent=pct,
@@ -191,7 +207,7 @@ def fetch_by_playwright() -> List[Product]:
                 const li = a.closest('li') || a.closest('div');
                 if (!href || !name || !li) continue;
 
-                // 브랜드: 상품 링크가 아닌 첫 a
+                // 브랜드: 상품 링크가 아닌 첫 a (공식 토큰은 나중에 파이썬에서 제거)
                 let brand = '';
                 const anchors = Array.from(li.querySelectorAll('a'));
                 for (const b of anchors) {
@@ -215,8 +231,8 @@ def fetch_by_playwright() -> List[Product]:
     seen = set()
     for row in data:
         href = row.get("href","")
-        name = clean_text(row.get("name",""))
-        brand = clean_text(row.get("brand",""))
+        name = remove_official_token(row.get("name",""))
+        brand = remove_official_token(row.get("brand",""))
         block_text = clean_text(row.get("block",""))
 
         if href.startswith("//"): href = "https:" + href
@@ -299,7 +315,7 @@ def drive_download_csv(service, folder_id: str, name: str) -> Optional[pd.DataFr
     while not done: _, done = dl.next_chunk()
     fh.seek(0); return pd.read_csv(fh)
 
-# ----- Slack -----
+# ----- Slack / translate -----
 def fmt_currency_jpy(v) -> str:
     try: return f"¥{int(round(float(v))):,}"
     except: return "¥0"
@@ -312,13 +328,29 @@ def slack_post(text: str):
     if r.status_code >= 300:
         print("[Slack 실패]", r.status_code, r.text)
 
+def translate_ja_to_ko_batch(lines: List[str]) -> List[str]:
+    flag = os.getenv("SLACK_TRANSLATE_JA2KO", "0").lower() in ("1","true","yes")
+    if not flag or not lines: return ["" for _ in lines]
+    try:
+        from googletrans import Translator
+        tr = Translator()
+        res = tr.translate(lines, src="ja", dest="ko")
+        # googletrans는 단건과 복수 반환 타입이 다를 수 있음
+        if isinstance(res, list):
+            return [r.text for r in res]
+        else:
+            return [res.text]
+    except Exception as e:
+        print("[Translate] 실패:", e)
+        return ["" for _ in lines]
+
 # ----- compare/message -----
 def to_dataframe(products: List[Product], date_str: str) -> pd.DataFrame:
     return pd.DataFrame([{
         "date": date_str,
         "rank": p.rank,
-        "brand": p.brand,
-        "product_name": p.title,
+        "brand": p.brand,                                # '公式' 제거 반영
+        "product_name": p.title,                         # '公式' 제거 반영
         "price": p.price,
         "orig_price": p.orig_price,
         "discount_percent": p.discount_percent,
@@ -329,16 +361,36 @@ def to_dataframe(products: List[Product], date_str: str) -> pd.DataFrame:
 def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> Dict[str, List[str]]:
     S = {"top10": [], "rising": [], "newcomers": [], "falling": [], "outs": [], "inout_count": 0}
 
-    # TOP 10 (브랜드 포함)
+    # TOP 10 (브랜드 포함, Slack용 괄호 제거)
     top10 = df_today.dropna(subset=["rank"]).sort_values("rank").head(10)
+    jp_for_tr = []
+    top10_lines = []
+
     for _, r in top10.iterrows():
-        disp = clean_text(r.get("product_name",""))
-        br = clean_text(r.get("brand",""))
-        if br and not disp.lower().startswith(br.lower()):
-            disp = f"{br} {disp}"
+        name_csv = clean_text(r.get("product_name",""))
+        brand_csv = clean_text(r.get("brand",""))
+
+        # Slack 표기용: 괄호류 제거
+        name_disp = strip_brackets_for_slack(name_csv)
+        brand_disp = brand_csv
+
+        # 제품명 앞에 브랜드 중복 방지 + '公式'는 이미 제거됨
+        if brand_disp and not name_disp.lower().startswith(brand_disp.lower()):
+            disp = f"{brand_disp} {name_disp}"
+        else:
+            disp = name_disp
+
+        jp_for_tr.append(disp)  # 번역용 원문(가격/할인 제외)
         name_link = f"<{r['url']}|{slack_escape(disp)}>"
         tail = f" (↓{int(r['discount_percent'])}%)" if pd.notnull(r.get("discount_percent")) else ""
-        S["top10"].append(f"{int(r['rank'])}. {name_link} — {fmt_currency_jpy(r['price'])}{tail}")
+        top10_lines.append(f"{int(r['rank'])}. {name_link} — {fmt_currency_jpy(r['price'])}{tail}")
+
+    # 번역 라인 생성(옵션)
+    ko_lines = translate_ja_to_ko_batch(jp_for_tr)
+    for i, base in enumerate(top10_lines):
+        S["top10"].append(base)
+        if ko_lines and i < len(ko_lines) and ko_lines[i]:
+            S["top10"].append(ko_lines[i])
 
     if df_prev is None or not len(df_prev):
         return S
@@ -359,11 +411,11 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     out    = set(p30.index) - set(t30.index)
 
     def full_name_link(row):
-        disp = clean_text(row.get("product_name",""))
+        name = strip_brackets_for_slack(clean_text(row.get("product_name","")))
         br = clean_text(row.get("brand",""))
-        if br and not disp.lower().startswith(br.lower()):
-            disp = f"{br} {disp}"
-        return f"<{row['url']}|{slack_escape(disp)}>"
+        if br and not name.lower().startswith(br.lower()):
+            name = f"{br} {name}"
+        return f"<{row['url']}|{slack_escape(name)}>"
 
     def line_move(name_link, prev_rank, curr_rank):
         if prev_rank is None and curr_rank is not None: return f"- {name_link} NEW → {curr_rank}위", 99999
