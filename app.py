@@ -5,13 +5,13 @@ Qoo10 JP Beauty Bestsellers (g=2)
 - CSV: 큐텐재팬_뷰티_랭킹_YYYY-MM-DD.csv (KST)
 - 비교 키: product_code 우선, 없으면 URL
 
-Slack 포맷(요청 사양):
-섹션 순서: TOP 10 → 급상승 → 뉴랭커 → 급하락(5개) → 랭크 인&아웃(개수만)
-TOP10:  "{순위}. {브랜드 제품명} — ₩{가격} (↓{할인%})"
-급상승/급하락/뉴랭커:
-  - "- {브랜드 제품명} 71위 → 7위 (↑64)"
-  - "- {브랜드 제품명} NEW → 19위"
-  - "- {브랜드 제품명} 23위 → OUT"
+Slack 포맷(간소화):
+  TOP 10: "순위.(변동) {브랜드 제품명} — ₩{가격} (↓{할인%})"
+    - 변동: (↑6)/(↓2)/(New), 변동 없으면 생략
+    - 각 라인 아래 번역 1줄(옵션: SLACK_TRANSLATE_JA2KO=1)
+  📉 급하락: "prev위 → curr위 (↓폭)"  최대 5개, 번역 포함
+  🔄 랭크 인&아웃: 개수만 표기
+  OUT은 급하락 섹션 끝에 이어서(최대 10개, 번역 없음)
 """
 
 import os, re, io, math, pytz, traceback
@@ -31,9 +31,9 @@ MOBILE_URLS = [
     "https://www.qoo10.jp/gmkt.inc/mobile/bestsellers/default.aspx?group_code=2",
 ]
 DESKTOP_URL = "https://www.qoo10.jp/gmkt.inc/Bestsellers/?g=2"
-MAX_RANK = int(os.getenv("QOO10_MAX_RANK", "200"))          # 수집 상한
-MAX_FALLING = 5                                              # 급하락 표기 상한
-MAX_OUT = int(os.getenv("QOO10_MAX_OUT", "10"))              # OUT 표기 상한
+MAX_RANK = int(os.getenv("QOO10_MAX_RANK", "200"))
+MAX_FALLING = 5
+MAX_OUT = int(os.getenv("QOO10_MAX_OUT", "10"))
 
 # ---------- time/utils ----------
 def now_kst(): return dt.datetime.now(KST)
@@ -69,7 +69,6 @@ def parse_jpy_amounts(text: str) -> List[int]:
     return [int(m.group(1).replace(",", "")) for m in YEN_AMOUNT_RE.finditer(text or "")]
 
 def compute_prices(block_text: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
-    """return (sale, orig, pct)  / sale=최솟값, orig=최댓값, pct=소수 버림"""
     amounts = parse_jpy_amounts(block_text)
     sale = orig = None
     if amounts:
@@ -101,7 +100,6 @@ def extract_goods_code(url: str, block_text: str = "") -> str:
 
 # ---------- brand ----------
 def bs_pick_brand(container) -> str:
-    """컨테이너 내에서 상품 링크가 아닌 첫 a를 브랜드로 추정. '公式' 제거."""
     if not container: return ""
     for a in container.select("a"):
         href = (a.get("href") or "").lower()
@@ -132,34 +130,23 @@ def parse_mobile_html(html: str) -> List[Product]:
     anchors = soup.select("a[href*='Goods.aspx'], a[href*='/Item/'], a[href*='/item/']")
     items: List[Product] = []
     seen = set()
-
     for a in anchors:
         href = a.get("href", "")
         if not href: continue
         container = a.find_parent("li") or a.find_parent("div")
         block_text = clean_text(container.get_text(" ", strip=True)) if container else clean_text(a.get_text(" ", strip=True))
-
-        # URL 정규화
         if href.startswith("//"): href = "https:" + href
         elif href.startswith("/"): href = "https://www.qoo10.jp" + href
-
-        # 상품코드/dedup
         code = extract_goods_code(href, block_text)
         key = code or href
         if key in seen: continue
         seen.add(key)
-
-        # 이름/브랜드/가격
         name = remove_official_token(a.get_text(" ", strip=True))
         brand = remove_official_token(bs_pick_brand(container))
         sale, orig, pct = compute_prices(block_text)
-
-        # 연속 랭크
-        items.append(Product(
-            rank=len(items)+1, brand=brand, title=name,
-            price=sale, orig_price=orig, discount_percent=pct,
-            url=href, product_code=code
-        ))
+        items.append(Product(rank=len(items)+1, brand=brand, title=name,
+                             price=sale, orig_price=orig, discount_percent=pct,
+                             url=href, product_code=code))
         if len(items) >= MAX_RANK: break
     return items
 
@@ -203,22 +190,18 @@ def fetch_by_playwright() -> List[Product]:
         page.goto(DESKTOP_URL, wait_until="domcontentloaded", timeout=60_000)
         try: page.wait_for_load_state("networkidle", timeout=25_000)
         except: pass
-
         data = page.evaluate("""
             () => {
               const as = Array.from(document.querySelectorAll("a[href*='Goods.aspx'], a[href*='/Item/'], a[href*='/item/']"));
-              const rows = [];
-              const seen = new Set();
+              const rows = []; const seen = new Set();
               for (const a of as) {
                 const href = a.getAttribute('href') || '';
                 const name = (a.textContent || '').replace(/\\s+/g,' ').trim();
                 const li = a.closest('li') || a.closest('div');
                 if (!href || !name || !li) continue;
-
                 // 브랜드: 상품 링크가 아닌 첫 a
                 let brand = '';
-                const anchors = Array.from(li.querySelectorAll('a'));
-                for (const b of anchors) {
+                for (const b of Array.from(li.querySelectorAll('a'))) {
                   const h = (b.getAttribute('href') || '').toLowerCase();
                   if (h.includes('goods.aspx') || h.includes('/item/')) continue;
                   const t = (b.textContent || '').replace(/\\s+/g,' ').trim();
@@ -226,15 +209,13 @@ def fetch_by_playwright() -> List[Product]:
                 }
                 const block = (li.innerText || '').replace(/\\s+/g,' ').trim();
                 const key = href + '|' + name;
-                if (seen.has(key)) continue;
-                seen.add(key);
+                if (seen.has(key)) continue; seen.add(key);
                 rows.push({href, name, brand, block});
               }
               return rows.slice(0, 500);
             }
         """)
         context.close(); browser.close()
-
     items: List[Product] = []
     seen = set()
     for row in data:
@@ -242,22 +223,16 @@ def fetch_by_playwright() -> List[Product]:
         name = remove_official_token(row.get("name",""))
         brand = remove_official_token(row.get("brand",""))
         block_text = clean_text(row.get("block",""))
-
         if href.startswith("//"): href = "https:" + href
         elif href.startswith("/"): href = "https://www.qoo10.jp" + href
-
         code = extract_goods_code(href, block_text)
         key = code or href
         if key in seen: continue
         seen.add(key)
-
         sale, orig, pct = compute_prices(block_text)
-
-        items.append(Product(
-            rank=len(items)+1, brand=brand, title=name,
-            price=sale, orig_price=orig, discount_percent=pct,
-            url=href, product_code=code
-        ))
+        items.append(Product(rank=len(items)+1, brand=brand, title=name,
+                             price=sale, orig_price=orig, discount_percent=pct,
+                             url=href, product_code=code))
         if len(items) >= MAX_RANK: break
     return items
 
@@ -325,7 +300,6 @@ def drive_download_csv(service, folder_id: str, name: str) -> Optional[pd.DataFr
 
 # ---------- Slack / translate ----------
 def fmt_currency_krw_like(v) -> str:
-    """요청 사양에 맞춰 ₩ 표기(실제 금액은 JPY 수집치)."""
     try: return f"₩{int(round(float(v))):,}"
     except: return "₩0"
 
@@ -339,20 +313,16 @@ def slack_post(text: str):
         print("[Slack 실패]", r.status_code, r.text)
 
 def translate_ja_to_ko_batch(lines: List[str]) -> List[str]:
-    """SLACK_TRANSLATE_JA2KO=1 일 때만 동작. 일본어가 없으면 빈 문자열 반환."""
-    flag = os.getenv("SLACK_TRANSLATE_JA2KO", "0").lower() in ("1", "true", "yes")
+    flag = os.getenv("SLACK_TRANSLATE_JA2KO", "0").lower() in ("1","true","yes")
     texts = [(l or "").strip() for l in lines]
     if not flag or not texts:
         return ["" for _ in texts]
-
-    seg_lists: List[Optional[List[Tuple[str, str]]]] = []
-    ja_pool: List[str] = []
+    seg_lists: List[Optional[List[Tuple[str,str]]]] = []; ja_pool: List[str] = []
     ja_run = re.compile(r"[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]+")
-
+    def has_ja(s): return bool(ja_run.search(s or ""))
     for line in texts:
-        if not contains_japanese(line):
-            seg_lists.append(None); continue
-        parts: List[Tuple[str, str]] = []; last = 0
+        if not has_ja(line): seg_lists.append(None); continue
+        parts: List[Tuple[str,str]] = []; last = 0
         for m in ja_run.finditer(line):
             if m.start() > last: parts.append(("raw", line[last:m.start()]))
             parts.append(("ja", line[m.start():m.end()])); last = m.end()
@@ -360,26 +330,21 @@ def translate_ja_to_ko_batch(lines: List[str]) -> List[str]:
         seg_lists.append(parts)
         for kind, txt in parts:
             if kind == "ja": ja_pool.append(txt)
-
-    if not ja_pool:
-        return ["" for _ in texts]
-
-    def _translate_batch(src_list: List[str]) -> List[str]:
+    if not ja_pool: return ["" for _ in texts]
+    def _translate_batch(src: List[str]) -> List[str]:
         try:
             from googletrans import Translator
             tr = Translator(service_urls=['translate.googleapis.com'])
-            res = tr.translate(src_list, src="ja", dest="ko")
+            res = tr.translate(src, src="ja", dest="ko")
             return [r.text for r in (res if isinstance(res, list) else [res])]
         except Exception:
             try:
                 from deep_translator import GoogleTranslator as DT
                 gt = DT(source='ja', target='ko')
-                return [gt.translate(t) if t else "" for t in src_list]
+                return [gt.translate(t) if t else "" for t in src]
             except Exception:
-                return ["" for _ in src_list]
-
+                return ["" for _ in src]
     ja_translated = _translate_batch(ja_pool)
-
     out: List[str] = []; it = iter(ja_translated)
     for parts in seg_lists:
         if parts is None: out.append(""); continue
@@ -391,16 +356,12 @@ def translate_ja_to_ko_batch(lines: List[str]) -> List[str]:
 
 # ---------- compare/message ----------
 def to_dataframe(products: List[Product], date_str: str) -> pd.DataFrame:
-    """
-    CSV에는 원문(괄호 포함)을 그대로 저장한다.
-    - brand: remove_official_token만 적용 (괄호 보존)
-    - product_name: title 원문 저장 (괄호 보존)
-    """
+    # CSV에는 원문(괄호 포함) 저장
     return pd.DataFrame([{
         "date": date_str,
         "rank": p.rank,
-        "brand": clean_text(p.brand),         # 괄호 보존
-        "product_name": clean_text(p.title),  # 괄호 보존
+        "brand": clean_text(p.brand),
+        "product_name": clean_text(p.title),
         "price": p.price,
         "orig_price": p.orig_price,
         "discount_percent": p.discount_percent,
@@ -409,9 +370,9 @@ def to_dataframe(products: List[Product], date_str: str) -> pd.DataFrame:
     } for p in products])
 
 def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> Dict[str, List[str]]:
-    S = {"top10": [], "rising": [], "newcomers": [], "falling": [], "outs": [], "inout_count": 0}
+    S = {"top10": [], "falling": [], "outs": [], "inout_count": 0}
 
-    # 슬랙 표시용 이름(여기에서만 괄호 제거)
+    # 슬랙 표시용 이름(여기에서만 괄호 제거 + 브랜드 결합)
     def plain_name(row):
         nm = strip_brackets_for_slack(clean_text(row.get("product_name","")))
         br = clean_text(row.get("brand",""))
@@ -433,118 +394,91 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
                 out.append(kos[i])
         return out
 
-    # ---------- TOP 10 (당일 1~10위)
+    # ---------- TOP 10 (변동 표기)
     top10 = df_today.dropna(subset=["rank"]).sort_values("rank").head(10)
-    jp_for_tr, top10_lines = [], []
-    for _, r in top10.iterrows():
-        nm = plain_name(r)  # 슬랙 표시는 괄호 제거
-        jp_for_tr.append(nm)
-        tail = f" (↓{int(r['discount_percent'])}%)" if pd.notnull(r.get("discount_percent")) else ""
-        top10_lines.append(f"{int(r['rank'])}. {link_name(r)} — {fmt_currency_krw_like(r['price'])}{tail}")
-    S["top10"] = interleave_with_ko(top10_lines, jp_for_tr, do_translate=True)
 
-    if df_prev is None or not len(df_prev):
-        return S
-
-    # ---------- 비교용 키 (product_code 우선, 없으면 URL)
+    # prev 전체(Top30 제한 없음)로 키 매핑
     def keyify(df):
         df = df.copy()
-        df["key"] = df.apply(
-            lambda x: x["product_code"] if (pd.notnull(x.get("product_code")) and str(x.get("product_code")).strip())
-            else x["url"], axis=1
-        )
-        df.set_index("key", inplace=True)
-        return df
+        df["key"] = df.apply(lambda x: x["product_code"] if (pd.notnull(x.get("product_code")) and str(x.get("product_code")).strip()) else x["url"], axis=1)
+        df.set_index("key", inplace=True); return df
 
-    df_t, df_p = keyify(df_today), keyify(df_prev)
+    prev_all = keyify(df_prev) if (df_prev is not None and len(df_prev)) else None
+
+    jp_for_tr, top10_lines = [], []
+    for _, r in top10.iterrows():
+        nm = plain_name(r)
+        jp_for_tr.append(nm)
+        # 변동 계산
+        marker = ""
+        if prev_all is not None:
+            key = r["product_code"] if (pd.notnull(r.get("product_code")) and str(r.get("product_code")).strip()) else r["url"]
+            if key in prev_all.index and pd.notnull(prev_all.loc[key, "rank"]):
+                pr, cr = int(prev_all.loc[key, "rank"]), int(r["rank"])
+                delta = pr - cr
+                if   delta > 0: marker = f"(↑{delta}) "
+                elif delta < 0: marker = f"(↓{abs(delta)}) "
+                else: marker = ""  # 변동없음 → 생략
+            else:
+                marker = "(New) "
+        else:
+            marker = ""  # 전일 없음
+
+        tail = f" (↓{int(r['discount_percent'])}%)" if pd.notnull(r.get("discount_percent")) else ""
+        top10_lines.append(f"{int(r['rank'])}. {marker}{link_name(r)} — {fmt_currency_krw_like(r['price'])}{tail}")
+    S["top10"] = interleave_with_ko(top10_lines, jp_for_tr, do_translate=True)
+
+    # 전일 없으면 여기서 종료 (급하락/OUT 계산은 전일 필요)
+    if prev_all is None:
+        return S
+
+    # ---------- 급하락(Top30 기준, 하락폭>0, 최대 5개, 번역 포함)
+    df_t = keyify(df_today)
     t30 = df_t[(df_t["rank"].notna()) & (df_t["rank"] <= 30)].copy()
-    p30 = df_p[(df_p["rank"].notna()) & (df_p["rank"] <= 30)].copy()
+    p30 = prev_all[(prev_all["rank"].notna()) & (prev_all["rank"] <= 30)].copy()
     common = set(t30.index) & set(p30.index)
-    new, out = set(t30.index) - set(p30.index), set(p30.index) - set(t30.index)
+    out = set(p30.index) - set(t30.index)
 
-    def line_move(name_link, prev_rank, curr_rank):
-        if prev_rank is None and curr_rank is not None: return f"- {name_link} NEW → {curr_rank}위", 99999
-        if curr_rank is None and prev_rank is not None: return f"- {name_link} {prev_rank}위 → OUT", 99999
-        delta = prev_rank - curr_rank
-        if   delta > 0: return f"- {name_link} {prev_rank}위 → {curr_rank}위 (↑{delta})", delta
-        elif delta < 0: return f"- {name_link} {prev_rank}위 → {curr_rank}위 (↓{abs(delta)})", abs(delta)
-        else:           return f"- {name_link} {prev_rank}위 → {curr_rank}위 (변동없음)", 0
-
-    # ---------- 급상승
-    rising_pack = []
-    for k in common:
-        pr, cr = int(p30.loc[k,"rank"]), int(t30.loc[k,"rank"])
-        imp = pr - cr
-        if imp > 0:
-            rising_pack.append((imp, cr, pr, slack_escape(str(t30.loc[k].get("product_name",""))),
-                                line_move(link_name(t30.loc[k]), pr, cr)[0], plain_name(t30.loc[k])))
-    rising_pack.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
-    rising_lines = [e[4] for e in rising_pack[:3]]
-    rising_jp    = [e[5] for e in rising_pack[:3]]
-    S["rising"] = interleave_with_ko(rising_lines, rising_jp, do_translate=True)
-
-    # ---------- 뉴랭커
-    newcom = []
-    for k in new:
-        cr = int(t30.loc[k,"rank"])
-        newcom.append((cr, f"- {link_name(t30.loc[k])} NEW → {cr}위", plain_name(t30.loc[k])))
-    newcom.sort(key=lambda x: x[0])  # 오늘 순위 오름차순
-    new_lines = [e[1] for e in newcom[:3]]
-    new_jp    = [e[2] for e in newcom[:3]]
-    S["newcomers"] = interleave_with_ko(new_lines, new_jp, do_translate=True)
-
-    # ---------- 급하락
     falling_pack = []
     for k in common:
         pr, cr = int(p30.loc[k,"rank"]), int(t30.loc[k,"rank"])
         drop = cr - pr
         if drop > 0:
             falling_pack.append((drop, cr, pr, slack_escape(str(t30.loc[k].get("product_name",""))),
-                                 line_move(link_name(t30.loc[k]), pr, cr)[0], plain_name(t30.loc[k])))
+                                 f"- {link_name(t30.loc[k])} {pr}위 → {cr}위 (↓{drop})",
+                                 plain_name(t30.loc[k])))
     falling_pack.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
     falling_lines = [e[4] for e in falling_pack[:MAX_FALLING]]
     falling_jp    = [e[5] for e in falling_pack[:MAX_FALLING]]
     S["falling"] = interleave_with_ko(falling_lines, falling_jp, do_translate=True)
 
-    # ---------- OUT (전일 Top30 → 당일 Top30 밖)
+    # ---------- OUT (전일 Top30 → 당일 Top30 밖), 번역 없음
     outs_pack = []
     for k in sorted(list(out)):
         pr = int(p30.loc[k,"rank"])
-        outs_pack.append((pr, line_move(link_name(p30.loc[k]), pr, None)[0], plain_name(p30.loc[k])))
-    outs_pack.sort(key=lambda x: x[0])  # 전일 순위 오름차순
-    outs_lines = [e[1] for e in outs_pack[:MAX_OUT]]
-    S["outs"] = interleave_with_ko(outs_lines, [], do_translate=False)  # 번역 생략
+        outs_pack.append((pr, f"- {link_name(p30.loc[k])} {pr}위 → OUT"))
+    outs_pack.sort(key=lambda x: x[0])
+    S["outs"] = [e[1] for e in outs_pack[:MAX_OUT]]
 
-    # ---------- 인&아웃 개수
-    S["inout_count"] = len(new) + len(out)
+    # ---------- 인&아웃 개수 (Top30 기준)
+    new_in = set(t30.index) - set(p30.index)
+    S["inout_count"] = len(new_in) + len(out)
     return S
 
 def build_slack_message(date_str: str, S: Dict[str, List[str]]) -> str:
     lines: List[str] = []
     lines.append(f"*🛒 큐텐 재팬 뷰티 랭킹 — {date_str}*")
     lines.append("")
-
     lines.append("*TOP 10*")
     lines.extend(S.get("top10") or ["- 데이터 없음"])
     lines.append("")
-
-    lines.append("*🔥 급상승*")
-    lines.extend(S.get("rising") or ["- 해당 없음"])
-    lines.append("")
-
-    lines.append("*🆕 뉴랭커*")
-    lines.extend(S.get("newcomers") or ["- 해당 없음"])
-    lines.append("")
-
     lines.append("*📉 급하락*")
     lines.extend(S.get("falling") or ["- 해당 없음"])
     if S.get("outs"):
         lines.extend(S["outs"])
-
     lines.append("")
     lines.append("*🔄 랭크 인&아웃*")
     lines.append(f"{S.get('inout_count', 0)}개의 제품이 인&아웃 되었습니다.")
-
     return "\n".join(lines)
 
 # ---------- main ----------
