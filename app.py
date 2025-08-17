@@ -5,12 +5,28 @@ Qoo10 JP Beauty Bestsellers (g=2)
 - 실패 시: 데스크톱 Playwright 폴백
 - CSV: 큐텐재팬_뷰티_랭킹_YYYY-MM-DD.csv (KST)
 - 비교 키: product_code(商品番号) 우선, 없으면 URL
-- 포맷:
-  * '公式' 토큰 제거(브랜드/상품명, CSV·Slack 모두)
-  * 가격: '...円'에 붙은 금액만 인식(판매수/리뷰수 숫자 배제), sale=최솟값, orig=최댓값
-  * Slack: 제품명에서 괄호류([]【】()（）) 내용 제거
-  * Slack 모든 섹션 각 항목 아래 1줄 한국어 번역(옵션, SLACK_TRANSLATE_JA2KO=1)
-  * 수집 상한: QOO10_MAX_RANK (기본 200)
+
+Slack 포맷(요청 사양):
+섹션 순서: TOP 10 → 급상승 → 뉴랭커 → 급하락(5개) → 랭크 인&아웃(개수만)
+TOP10 라인:  "{순위}. {브랜드 제품명} — ₩{가격} (↓{할인%})"
+  - 브랜드가 없으면 제품명만
+  - 할인율 있으면만 "(↓27%)" 표기, 소수점 버림
+급상승/급하락/뉴랭커 라인 예시
+  - "- 브랜드 제품명 71위 → 7위 (↑64)"
+  - "- 브랜드 제품명 NEW → 19위"
+  - "- 브랜드 제품명 23위 → OUT"   # 급하락 섹션 마지막에 OUT도 함께 나열
+
+비교/선정 기준 (전일 CSV와 비교)
+  TOP 10: 당일 1~10위
+  급상승: 전일·당일 모두 존재 & (prev_rank - curr_rank) > 0
+          정렬: 개선폭 내림차순 → 오늘 순위 오름차순 → 전일 순위 오름차순 → 제품명
+          최대 3개
+  뉴랭커: 전일 Top30 밖(또는 미등장) → 당일 Top30(<=30) 진입
+          정렬: 오늘 순위 오름차순, 최대 3개
+  급하락: 전일·당일 모두 존재 & (curr_rank - prev_rank) > 0
+          정렬: 하락폭 내림차순 → 오늘 순위 → 전일 순위 → 제품명, 최대 5개
+          OUT도 함께 표기: 전일 Top30 이었는데 당일 Top30 밖이면 "23위 → OUT"
+  랭크 인&아웃: 인(차트인) + 아웃(랭크아웃) 합계만 한 줄로 표기
 """
 
 import os, re, io, math, pytz, traceback
@@ -30,7 +46,7 @@ MOBILE_URLS = [
     "https://www.qoo10.jp/gmkt.inc/mobile/bestsellers/default.aspx?group_code=2",
 ]
 DESKTOP_URL = "https://www.qoo10.jp/gmkt.inc/Bestsellers/?g=2"
-MAX_RANK = int(os.getenv("QOO10_MAX_RANK", "200"))  # ← 기본 200위까지 수집
+MAX_RANK = int(os.getenv("QOO10_MAX_RANK", "200"))  # 기본 200위
 
 # ---------- time/utils ----------
 def now_kst(): return dt.datetime.now(KST)
@@ -44,7 +60,6 @@ def slack_escape(s): return s.replace("&","&amp;").replace("<","&lt;").replace("
 OFFICIAL_PAT = re.compile(r"^\s*(公式|公式ショップ|公式ストア)\s*", re.I)
 BRACKETS_PAT = re.compile(r"(\[.*?\]|【.*?】|（.*?）|\(.*?\))")
 
-# ----- 일본어 감지 (번역 시 영어-only는 제외)
 JP_CHAR_RE = re.compile(r"[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]")
 def contains_japanese(s: str) -> bool:
     return bool(JP_CHAR_RE.search(s or ""))
@@ -68,7 +83,7 @@ def parse_jpy_amounts(text: str) -> List[int]:
     return [int(m.group(1).replace(",", "")) for m in YEN_AMOUNT_RE.finditer(text or "")]
 
 def compute_prices(block_text: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
-    """return (sale, orig, pct)  / sale=최소, orig=최대, pct=버림"""
+    """return (sale, orig, pct) / sale=최소, orig=최대, pct=버림"""
     amounts = parse_jpy_amounts(block_text)
     sale = orig = None
     if amounts:
@@ -82,6 +97,7 @@ def compute_prices(block_text: str) -> Tuple[Optional[int], Optional[int], Optio
     if m:
         pct = int(m.group(1))
     elif orig and sale and orig > 0:
+        # 소수점 버림
         pct = max(0, int(math.floor((1 - sale / orig) * 100)))
     return sale, orig, pct
 
@@ -323,9 +339,10 @@ def drive_download_csv(service, folder_id: str, name: str) -> Optional[pd.DataFr
     fh.seek(0); return pd.read_csv(fh)
 
 # ---------- Slack / translate ----------
-def fmt_currency_jpy(v) -> str:
-    try: return f"¥{int(round(float(v))):,}"
-    except: return "¥0"
+def fmt_currency_krw_like(v) -> str:
+    """요청 사양에 맞춰 가격 앞에 ₩ 표기(실제 금액은 JPY기준 수집)."""
+    try: return f"₩{int(round(float(v))):,}"
+    except: return "₩0"
 
 def slack_post(text: str):
     url = os.getenv("SLACK_WEBHOOK_URL")
@@ -337,23 +354,20 @@ def slack_post(text: str):
 
 def translate_ja_to_ko_batch(lines: List[str]) -> List[str]:
     """
-    JA 구간만 번역하고 영어/숫자/기호는 그대로 둠.
     SLACK_TRANSLATE_JA2KO=1 일 때만 동작. 일본어가 없으면 빈 문자열 반환.
     """
     flag = os.getenv("SLACK_TRANSLATE_JA2KO", "0").lower() in ("1", "true", "yes")
     texts = [(l or "").strip() for l in lines]
     if not flag or not texts:
-        print("[Translate] OFF")
         return ["" for _ in texts]
 
-    # 라인 → [("raw",txt)/("ja",txt)] 세그먼트 분해
     seg_lists: List[Optional[List[Tuple[str, str]]]] = []
     ja_pool: List[str] = []
     ja_run = re.compile(r"[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]+")
 
     for line in texts:
         if not contains_japanese(line):
-            seg_lists.append(None)  # 번역 줄 없음
+            seg_lists.append(None)
             continue
         parts: List[Tuple[str, str]] = []
         last = 0
@@ -364,7 +378,6 @@ def translate_ja_to_ko_batch(lines: List[str]) -> List[str]:
             last = m.end()
         if last < len(line):
             parts.append(("raw", line[last:]))
-
         seg_lists.append(parts)
         for kind, txt in parts:
             if kind == "ja":
@@ -373,28 +386,22 @@ def translate_ja_to_ko_batch(lines: List[str]) -> List[str]:
     if not ja_pool:
         return ["" for _ in texts]
 
-    # ---- 번역 백엔드: googletrans → deep-translator(둘 다 구글) ----
     def _translate_batch(src_list: List[str]) -> List[str]:
-        # 1) googletrans
         try:
             from googletrans import Translator
             tr = Translator(service_urls=['translate.googleapis.com'])
             res = tr.translate(src_list, src="ja", dest="ko")
             return [r.text for r in (res if isinstance(res, list) else [res])]
-        except Exception as e1:
-            print("[Translate] googletrans 실패:", e1)
-        # 2) deep-translator (Google)
-        try:
-            from deep_translator import GoogleTranslator as DT
-            gt = DT(source='ja', target='ko')
-            return [gt.translate(t) if t else "" for t in src_list]
-        except Exception as e2:
-            print("[Translate] deep-translator 실패:", e2)
-            return ["" for _ in src_list]
+        except Exception:
+            try:
+                from deep_translator import GoogleTranslator as DT
+                gt = DT(source='ja', target='ko')
+                return [gt.translate(t) if t else "" for t in src_list]
+            except Exception:
+                return ["" for _ in src_list]
 
     ja_translated = _translate_batch(ja_pool)
 
-    # 조립: raw는 그대로, ja는 번역으로 치환
     out: List[str] = []
     it = iter(ja_translated)
     for parts in seg_lists:
@@ -405,11 +412,7 @@ def translate_ja_to_ko_batch(lines: List[str]) -> List[str]:
         for kind, txt in parts:
             buf.append(txt if kind == "raw" else next(it, ""))
         out.append("".join(buf))
-
-    print(f"[Translate] done (JA-only, google): {sum(1 for x in out if x)} lines")
     return out
-# ===== /translate =====
-
 
 # ---------- compare/message ----------
 def to_dataframe(products: List[Product], date_str: str) -> pd.DataFrame:
@@ -426,17 +429,20 @@ def to_dataframe(products: List[Product], date_str: str) -> pd.DataFrame:
     } for p in products])
 
 def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> Dict[str, List[str]]:
+    """
+    섹션: top10 / rising / newcomers / falling / outs / inout_count
+    """
     S = {"top10": [], "rising": [], "newcomers": [], "falling": [], "outs": [], "inout_count": 0}
 
-    # 공통: 브랜드+이름(괄호 제거) 원문 생성
+    # 공통: 표시용 이름 (브랜드 + 괄호 제거 제품명)
     def plain_name(row):
         nm = strip_brackets_for_slack(clean_text(row.get("product_name","")))
         br = clean_text(row.get("brand",""))
         if br and not nm.lower().startswith(br.lower()):
             nm = f"{br} {nm}"
-        return nm
+        return nm.strip()
 
-    # 공통: 번역 interleave
+    # 공통: 번역 interleave (옵션)
     def interleave_with_ko(lines: List[str], jp_texts: List[str]) -> List[str]:
         kos = translate_ja_to_ko_batch(jp_texts)
         out = []
@@ -446,21 +452,21 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
                 out.append(kos[i])
         return out
 
-    # ---- TOP 10
+    # ---------- TOP 10 (당일 1~10위)
     top10 = df_today.dropna(subset=["rank"]).sort_values("rank").head(10)
     jp_for_tr, top10_lines = [], []
     for _, r in top10.iterrows():
-        disp = plain_name(r)  # 괄호 제거+브랜드 결합
-        jp_for_tr.append(disp)  # 번역 문장(가격/할인 제외)
+        disp = plain_name(r)
+        jp_for_tr.append(disp)  # 번역은 이름만
         name_link = f"<{r['url']}|{slack_escape(disp)}>"
         tail = f" (↓{int(r['discount_percent'])}%)" if pd.notnull(r.get("discount_percent")) else ""
-        top10_lines.append(f"{int(r['rank'])}. {name_link} — {fmt_currency_jpy(r['price'])}{tail}")
+        top10_lines.append(f"{int(r['rank'])}. {name_link} — {fmt_currency_krw_like(r['price'])}{tail}")
     S["top10"] = interleave_with_ko(top10_lines, jp_for_tr)
 
     if df_prev is None or not len(df_prev):
         return S
 
-    # ---- 비교용 키
+    # ---------- 비교용 키 (product_code 우선, 없으면 URL)
     def keyify(df):
         df = df.copy()
         df["key"] = df.apply(lambda x: x["product_code"] if (pd.notnull(x.get("product_code")) and str(x.get("product_code")).strip()) else x["url"], axis=1)
@@ -468,6 +474,8 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
         return df
 
     df_t, df_p = keyify(df_today), keyify(df_prev)
+
+    # Top30 내부 비교셋
     t30 = df_t[(df_t["rank"].notna()) & (df_t["rank"] <= 30)].copy()
     p30 = df_p[(df_p["rank"].notna()) & (df_p["rank"] <= 30)].copy()
     common = set(t30.index) & set(p30.index)
@@ -477,19 +485,28 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
         return f"<{row['url']}|{slack_escape(plain_name(row))}>"
 
     def line_move(name_link, prev_rank, curr_rank):
-        if prev_rank is None and curr_rank is not None: return f"- {name_link} NEW → {curr_rank}위", 99999
-        if curr_rank is None and prev_rank is not None: return f"- {name_link} {prev_rank}위 → OUT", 99999
+        """
+        예시:
+          - {name} 71위 → 7위 (↑64)
+          - {name} NEW → 19위
+          - {name} 23위 → OUT
+        """
+        if prev_rank is None and curr_rank is not None:
+            return f"- {name_link} NEW → {curr_rank}위", 99999
+        if curr_rank is None and prev_rank is not None:
+            return f"- {name_link} {prev_rank}위 → OUT", 99999
         delta = prev_rank - curr_rank
         if   delta > 0: return f"- {name_link} {prev_rank}위 → {curr_rank}위 (↑{delta})", delta
         elif delta < 0: return f"- {name_link} {prev_rank}위 → {curr_rank}위 (↓{abs(delta)})", abs(delta)
         else:           return f"- {name_link} {prev_rank}위 → {curr_rank}위 (변동없음)", 0
 
-    # ---- 급상승
+    # ---------- 급상승 (공통 ∩, 개선폭>0)
     rising_pack = []
     for k in common:
         pr, cr = int(p30.loc[k,"rank"]), int(t30.loc[k,"rank"])
         imp = pr - cr
         if imp > 0:
+            # 정렬키: 개선폭 내림차순 → 오늘 순위 → 전일 순위 → 제품명
             rising_pack.append((imp, cr, pr, slack_escape(str(t30.loc[k].get("product_name",""))),
                                 line_move(full_name_link(t30.loc[k]), pr, cr)[0], plain_name(t30.loc[k])))
     rising_pack.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
@@ -497,22 +514,23 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     rising_jp    = [e[5] for e in rising_pack[:3]]
     S["rising"] = interleave_with_ko(rising_lines, rising_jp)
 
-    # ---- 뉴랭커
+    # ---------- 뉴랭커 (전일 Top30 밖 → 당일 Top30 진입)
     newcom = []
     for k in new:
         cr = int(t30.loc[k,"rank"])
         newcom.append((cr, f"- {full_name_link(t30.loc[k])} NEW → {cr}위", plain_name(t30.loc[k])))
-    newcom.sort(key=lambda x: x[0])
+    newcom.sort(key=lambda x: x[0])  # 오늘 순위 오름차순
     new_lines = [e[1] for e in newcom[:3]]
     new_jp    = [e[2] for e in newcom[:3]]
     S["newcomers"] = interleave_with_ko(new_lines, new_jp)
 
-    # ---- 급하락
+    # ---------- 급하락 (공통 ∩, 하락폭>0) + OUT도 함께
     falling_pack = []
     for k in common:
         pr, cr = int(p30.loc[k,"rank"]), int(t30.loc[k,"rank"])
         drop = cr - pr
         if drop > 0:
+            # 정렬키: 하락폭 내림차순 → 오늘 순위 → 전일 순위 → 제품명
             falling_pack.append((drop, cr, pr, slack_escape(str(t30.loc[k].get("product_name",""))),
                                  line_move(full_name_link(t30.loc[k]), pr, cr)[0], plain_name(t30.loc[k])))
     falling_pack.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
@@ -520,32 +538,28 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     falling_jp    = [e[5] for e in falling_pack[:5]]
     S["falling"] = interleave_with_ko(falling_lines, falling_jp)
 
-    # ---- OUT
+    # OUT: 전일 Top30 였으나 당일 Top30 밖
     outs_pack = []
     for k in sorted(list(out)):
         pr = int(p30.loc[k,"rank"])
         outs_pack.append((pr, line_move(full_name_link(p30.loc[k]), pr, None)[0], plain_name(p30.loc[k])))
-    outs_pack.sort(key=lambda x: x[0])
+    outs_pack.sort(key=lambda x: x[0])  # 전일 순위 오름차순
     outs_lines = [e[1] for e in outs_pack]
     outs_jp    = [e[2] for e in outs_pack]
     S["outs"] = interleave_with_ko(outs_lines, outs_jp)
 
+    # 인&아웃 개수(차트인 + 랭크아웃)
     S["inout_count"] = len(new) + len(out)
     return S
 
 def build_slack_message(date_str: str, S: Dict[str, List[str]]) -> str:
     """
-    올영 국내/글로벌, 다이소와 동일한 섹션 구성/순서/스타일.
-    - 제목
-    - TOP 10
-    - 🔥 급상승
-    - 🆕 뉴랭커
-    - 📉 급하락
-    - ⏹️ OUT (있을 때만 노출)
-    - 🔄 랭크 인&아웃 요약
+    섹션 순서 고정:
+      TOP 10 → 급상승 → 뉴랭커 → 급하락(5개) → 랭크 인&아웃(개수만)
+    OUT 목록은 '급하락' 섹션 끝에 함께 나열
     """
     lines: List[str] = []
-    lines.append(f"*🛒 큐텐 재팬 뷰티 랭킹 — {date_str}*")
+    lines.append(f"*큐텐 재팬 뷰티 랭킹 — {date_str}*")
     lines.append("")
 
     # TOP 10
@@ -554,26 +568,24 @@ def build_slack_message(date_str: str, S: Dict[str, List[str]]) -> str:
     lines.append("")
 
     # 급상승
-    lines.append("*🔥 급상승*")
+    lines.append("*급상승*")
     lines.extend(S.get("rising") or ["- 해당 없음"])
     lines.append("")
 
     # 뉴랭커
-    lines.append("*🆕 뉴랭커*")
+    lines.append("*뉴랭커*")
     lines.extend(S.get("newcomers") or ["- 해당 없음"])
     lines.append("")
 
-    # 급하락 + OUT
-    lines.append("*📉 급하락*")
+    # 급하락 (최대 5개) + OUT
+    lines.append("*급하락*")
     lines.extend(S.get("falling") or ["- 해당 없음"])
     if S.get("outs"):
-        lines.append("")
-        lines.append("*⏹️ OUT*")
-        lines.extend(S.get("outs"))
+        lines.extend(S["outs"])  # 바로 이어서 OUT 라인 나열
 
-    # 인&아웃 요약
+    # 랭크 인&아웃 (개수만)
     lines.append("")
-    lines.append("*🔄 랭크 인&아웃*")
+    lines.append("*랭크 인&아웃*")
     lines.append(f"{S.get('inout_count', 0)}개의 제품이 인&아웃 되었습니다.")
 
     return "\n".join(lines)
@@ -599,7 +611,7 @@ def main():
     df_today.to_csv(os.path.join("data", file_today), index=False, encoding="utf-8-sig")
     print("로컬 저장:", file_today)
 
-    # Google Drive
+    # Google Drive (선택)
     df_prev = None
     folder = normalize_folder_id(os.getenv("GDRIVE_FOLDER_ID",""))
     if folder:
