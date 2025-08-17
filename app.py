@@ -422,65 +422,111 @@ def keyify(df):
     return df
 
 # -------------------- Sections --------------------
-def build_sections(df_today:pd.DataFrame, df_prev:Optional[pd.DataFrame])->Dict[str,List[str]]:
-    S={"top10":[], "falling":[], "outs":[], "inout_count":0}
+def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> Dict[str, List[str]]:
+    """
+    슬랙 포맷 전용 섹션 빌드 (크롤링/브랜드/드라이브 로직에는 영향 없음)
+      - TOP10: (↑n)/(↓n)/(New) 마커 + 번역 줄
+      - 급상승/뉴랭커: 제거
+      - 급하락: Top30 교집합 하락 + OUT 포함, 최대 5개만 노출, 각 항목 번역 줄 포함
+      - 인&아웃: 개수만
+    """
+    S = {"top10": [], "falling": [], "inout_count": 0}
 
     def plain_name(r):
         nm = strip_brackets_for_slack(clean_text(r.get("product_name","")))
         br = clean_text(r.get("brand",""))
-        if br and not nm.lower().startswith(br.lower()): nm = f"{br} {nm}"
+        if br and not nm.lower().startswith(br.lower()):
+            nm = f"{br} {nm}"
         return nm
 
-    def full_link(r): return f"<{r['url']}|{slack_escape(plain_name(r))}>"
+    def link(r): 
+        return f"<{r['url']}|{slack_escape(plain_name(r))}>"
 
-    def interleave_ko(lines: List[str], jp_texts: List[str]) -> List[str]:
-        kos = translate_ja_to_ko_batch(jp_texts); out=[]
-        for i,ln in enumerate(lines):
+    def interleave(lines, jp_texts):
+        kos = translate_ja_to_ko_batch(jp_texts)
+        out = []
+        for i, ln in enumerate(lines):
             out.append(ln)
-            if kos and i < len(kos) and kos[i]: out.append(kos[i])
+            if kos and i < len(kos) and kos[i]:
+                out.append(kos[i])
         return out
 
+    # ---- TOP10
     prev_all = keyify(df_prev) if (df_prev is not None and len(df_prev)) else None
     jp, lines = [], []
-    for _, r in df_today.dropna(subset=["rank"]).sort_values("rank").head(10).iterrows():
-        jp.append(plain_name(r)); marker = ""
+    top10 = df_today.dropna(subset=["rank"]).sort_values("rank").head(10)
+    for _, r in top10.iterrows():
+        jp.append(plain_name(r))
+        marker = ""
         if prev_all is not None:
-            k = (_norm_product_code(r["product_code"]) or _norm_url(r["url"]))
-            if k in prev_all.index and pd.notnull(prev_all.loc[k,"rank"]):
-                pr, cr = int(prev_all.loc[k,"rank"]), int(r["rank"]); d = pr - cr
+            k = (_norm_product_code(r.get("product_code")) or _norm_url(r.get("url")))
+            if (k in prev_all.index) and pd.notnull(prev_all.loc[k, "rank"]):
+                pr, cr = int(prev_all.loc[k, "rank"]), int(r["rank"]); d = pr - cr
                 marker = f"(↑{d}) " if d>0 else (f"(↓{abs(d)}) " if d<0 else "")
-            else: marker = "(New) "
-        tail = f" (↓{int(r['discount_percent'])}%)" if pd.notnull(r["discount_percent"]) else ""
-        lines.append(f"{int(r['rank'])}. {marker}{full_link(r)} — {fmt_currency(r['price'])}{tail}")
-    S["top10"] = interleave_ko(lines, jp)
+            else:
+                marker = "(New) "
+        tail = f" (↓{int(r['discount_percent'])}%)" if pd.notnull(r.get('discount_percent')) else ""
+        lines.append(f"{int(r['rank'])}. {marker}{link(r)} — {fmt_currency(r.get('price'))}{tail}")
+    S["top10"] = interleave(lines, jp)
 
-    if prev_all is None: return S
+    if prev_all is None:
+        return S
 
-    df_t = keyify(df_today); t30 = df_t[df_t["rank"]<=30]; p30 = prev_all[prev_all["rank"]<=30]
-    common = set(t30.index)&set(p30.index); out = set(p30.index)-set(t30.index)
+    # ---- 급하락 (Top30 교집합 하락 + OUT 포함, 최대 5개)
+    df_t = keyify(df_today)
+    t30 = df_t[(df_t["rank"].notna()) & (df_t["rank"] <= 30)]
+    p30 = prev_all[(prev_all["rank"].notna()) & (prev_all["rank"] <= 30)]
+    common = set(t30.index) & set(p30.index)
+    out = set(p30.index) - set(t30.index)
 
-    movers=[]
+    movers = []
     for k in common:
-        pr, cr = int(p30.loc[k,"rank"]), int(t30.loc[k,"rank"])
+        pr, cr = int(p30.loc[k, "rank"]), int(t30.loc[k, "rank"])
         drop = cr - pr
         if drop > 0:
             row = t30.loc[k]
-            movers.append((drop, cr, pr, f"- {full_link(row)} {pr}위 → {cr}위 (↓{drop})", plain_name(row)))
-    movers.sort(key=lambda x:(-x[0], x[1], x[2], x[4]))
+            movers.append((drop, cr, pr, f"- {link(row)} {pr}위 → {cr}위 (↓{drop})", plain_name(row)))
+    # 정렬: 하락폭 내림차순 → 오늘 순위 → 전일 순위 → 제품명
+    movers.sort(key=lambda x: (-x[0], x[1], x[2], x[4]))
+
     chosen_lines, chosen_jp = [], []
     for _,_,_,txt,jpn in movers:
-        if len(chosen_lines) >= MAX_FALLING: break
+        if len(chosen_lines) >= 5: break
         chosen_lines.append(txt); chosen_jp.append(jpn)
-    if len(chosen_lines) < MAX_FALLING:
-        outs_sorted = sorted(list(out), key=lambda k: int(p30.loc[k,"rank"]))
+
+    if len(chosen_lines) < 5:
+        outs_sorted = sorted(list(out), key=lambda k: int(p30.loc[k, "rank"]))
         for k in outs_sorted:
-            if len(chosen_lines) >= MAX_FALLING: break
-            row = p30.loc[k]; txt = f"- {full_link(row)} {int(row['rank'])}위 → OUT"
+            if len(chosen_lines) >= 5: break
+            row = p30.loc[k]
+            txt = f"- {link(row)} {int(row['rank'])}위 → OUT"
             chosen_lines.append(txt); chosen_jp.append(plain_name(row))
-    S["falling"] = interleave_ko(chosen_lines, chosen_jp)
-    S["outs"] = []
-    S["inout_count"] = len(set(t30.index)-set(p30.index)) + len(out)
+
+    S["falling"] = interleave(chosen_lines, chosen_jp)
+
+    # ---- 인&아웃 개수
+    S["inout_count"] = len(set(t30.index) - set(p30.index)) + len(out)
+
     return S
+
+
+def build_slack_message(date_str: str, S: Dict[str, List[str]]) -> str:
+    lines: List[str] = []
+    lines.append(f"*🛒 큐텐 재팬 뷰티 랭킹 — {date_str}*")
+    lines.append("")
+    lines.append("*TOP 10*")
+    lines.extend(S.get("top10") or ["- 데이터 없음"])
+    lines.append("")
+    lines.append("*📉 급하락*")
+    lines.extend(S.get("falling") or ["- 해당 없음"])
+    lines.append("")
+    lines.append("*🔄 랭크 인&아웃*")
+    lines.append(f"{S.get('inout_count', 0)}개의 제품이 인&아웃 되었습니다.")
+    return "\n".join(lines)
+
+# ... (중략) ...
+# 나머지 함수/크롤링/구글드라이브 업로드/메인 진입점 등은 기존 파일 그대로 유지
+# ===== app.py (끝) =====
 
 # -------------------- Slack message --------------------
 def build_slack_message(date,S):
