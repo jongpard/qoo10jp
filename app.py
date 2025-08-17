@@ -1,586 +1,423 @@
-# app.py
 # -*- coding: utf-8 -*-
-"""
-Qoo10 Japan Beauty Ranking Scraper
-- 수집: Qoo10 모바일 랭킹(뷰티 그룹) 기준 최대 200개
-- 파일명: 큐텐재팬_뷰티_랭킹_YYYY-MM-DD.csv (KST)
-- Slack 포맷: TOP10 → 급상승(상위 3) → 뉴랭커(상위 3) → 급하락(상위 5) → 랭크 인&아웃(개수만)
-- 비교 기준: 전일 CSV (Drive 폴더 내 prefix 매칭, 가장 최근 날짜)
-- 할인율: 소수점 없이 버림, 괄호 표기 (↓27%)
-- 제품코드: URL 끝의 숫자 id
-"""
-
-from __future__ import annotations
-
 import os
 import re
 import csv
+import io
 import time
 import json
 import math
-import traceback
 import datetime as dt
-from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
-import requests
-from bs4 import BeautifulSoup
-
-# Playwright (동적 렌더링 폴백)
+# ---------- Playwright ----------
 from playwright.sync_api import sync_playwright
 
-# Slack
-import urllib.request
-import urllib.error
-import urllib.parse
-
-# Google Drive (OAuth)
+# ---------- Drive (OAuth) ----------
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 from google.oauth2.credentials import Credentials
 
+# ---------- Requests / Parser ----------
+from bs4 import BeautifulSoup
 
 # =========================
-# 기본 설정 / 경로 / 시간대
+# Config
 # =========================
-KST = dt.timezone(dt.timedelta(hours=9))
-TODAY = dt.datetime.now(KST).date()
+QOO10_URL = "https://www.qoo10.jp/gmkt.inc/Mobile/Bestsellers/Default.aspx?group_code=2"  # Beauty/ビューティ
+DATA_DIR = "data"
+TOP_LIMIT_SAVE = 200   # 저장 상한
+TOP_LIMIT_COMPARE = 30 # 비교 구간 상한 (급상승/뉴랭커/급하락 산정용)
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+# Slack / Drive ENV
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
+GDRIVE_FOLDER_ID   = os.getenv("GDRIVE_FOLDER_ID", "")
 
-# Qoo10 모바일 뷰티 랭킹 URL
-QOO10_URL = "https://www.qoo10.jp/gmkt.inc/Mobile/Bestsellers/Default.aspx?group_code=2"
-
-# Slack 번역 옵션 (일본어만 → 한국어)
-ENABLE_JA2KO = os.getenv("SLACK_TRANSLATE_JA2KO", "").strip() in ("1", "true", "TRUE")
-
-
-def log(msg: str):
-    print(msg, flush=True)
-
+GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN", "")
 
 # =========================
-# 유틸: 텍스트/숫자 정규화
+# Utils
 # =========================
-JP_BRACKET_PATTERNS = [
-    r"【.*?】", r"［.*?］", r"〔.*?〕", r"〈.*?〉", r"《.*?》", r"「.*?」", r"『.*?』", r"\(.*?\)", r"（.*?）"
-]
+def kst_today() -> dt.date:
+    # GitHub runner 기준 UTC → KST(+9)
+    return (dt.datetime.utcnow() + dt.timedelta(hours=9)).date()
 
-def normalize_text(s: str) -> str:
-    if not s:
-        return ""
-    s = s.replace("\u3000", " ")  # 전각 공백
-    # "公式" 제거
-    s = re.sub(r"^\s*公式\s*", "", s).strip()
-    # 각종 괄호 블록 제거
-    for pat in JP_BRACKET_PATTERNS:
-        s = re.sub(pat, " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+def ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
 
-def parse_price(text: str) -> Optional[int]:
+def clean_name(raw: str) -> str:
+    if not raw:
+        return raw
+    name = raw
+    # 公式 제거
+    name = re.sub(r"^\s*公式\s*", "", name)
+    # 【...】 / [...] / (...) 제거 (내용 포함 통째 제거)
+    name = re.sub(r"【.*?】", "", name)
+    name = re.sub(r"\[.*?\]", "", name)
+    name = re.sub(r"\(.*?\)", "", name)
+    # 공백 정리
+    name = re.sub(r"\s+", " ", name).strip()
+    return name
+
+def extract_price(text: str) -> Optional[int]:
     if not text:
         return None
-    m = re.findall(r"[\d,]+", text.replace(",", ""))
+    # ¥1,234 또는 1,234円 패턴 우선
+    m = re.search(r"[¥￥]\s?([0-9,]+)", text)
+    if not m:
+        m = re.search(r"([0-9,]+)\s*円", text)
     if not m:
         return None
-    try:
-        return int(m[-1])
-    except:
+    return int(m.group(1).replace(",", ""))
+
+def extract_code_from_url(url: str) -> Optional[str]:
+    if not url:
         return None
+    # /item/<digits>
+    m = re.search(r"/item/(\d+)", url)
+    if m:
+        return m.group(1)
+    # ?no=123 등 예비
+    m = re.search(r"[?&](?:no|goods_code|goodscode|gdno)=(\d+)", url, re.I)
+    if m:
+        return m.group(1)
+    # 마지막 숫자 토큰
+    m = re.search(r"(\d+)(?:$|\?)", url)
+    return m.group(1) if m else None
 
-def extract_pid(url: str) -> str:
-    # .../item/.../<PID> (일반/모바일 모두 숫자 id가 끝에 존재)
-    if not url:
-        return ""
-    m = re.search(r"/(\d+)(?:\?|$)", url)
-    return m.group(1) if m else ""
-
-def to_percent_floor(off: float) -> int:
-    try:
-        if off < 0:
-            off = 0
-        return math.floor(off)
-    except:
-        return 0
-
-def has_japanese(text: str) -> bool:
-    if not text:
-        return False
-    # 히라가나, 가타카나, 일부 한자 범위
-    return re.search(r"[\u3040-\u30FF\u4E00-\u9FFF]", text) is not None
-
-
-# =========================
-# Slack
-# =========================
-def slack_post(text: str):
-    url = os.environ.get("SLACK_WEBHOOK_URL", "")
-    if not url:
-        log("[Slack] SLACK_WEBHOOK_URL 미설정")
-        return
-    payload = json.dumps({"text": text}).encode("utf-8")
-    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            log(f"[Slack] 전송 완료: {resp.status}")
-    except Exception as e:
-        log(f"[Slack] 전송 실패: {e}")
-
-
-# =========================
-# Translator (선택)
-# =========================
-def translate_ja_to_ko_batch(lines: List[str]) -> List[str]:
-    if not ENABLE_JA2KO:
-        return ["" for _ in lines]
-    try:
-        from googletrans import Translator  # 가벼운 번역기(신뢰성은 낮으나 무료)
-        tr = Translator()
-        outs = []
-        for s in lines:
-            if not s or not has_japanese(s):
-                outs.append("")
-                continue
-            try:
-                res = tr.translate(s, src="ja", dest="ko")
-                outs.append(res.text)
-            except Exception:
-                outs.append("")
-        return outs
-    except Exception as e:
-        log(f"[Translate] 사용 안함/오류: {e}")
-        return ["" for _ in lines]
-
-
-# =========================
-# Google Drive
-# =========================
-def _drive_service():
+def drive_client():
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN):
+        return None
     creds = Credentials(
         None,
-        refresh_token=os.getenv("GOOGLE_REFRESH_TOKEN"),
+        refresh_token=GOOGLE_REFRESH_TOKEN,
         token_uri="https://oauth2.googleapis.com/token",
-        client_id=os.getenv("GOOGLE_CLIENT_ID"),
-        client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
-        scopes=["https://www.googleapis.com/auth/drive.file"],
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        scopes=["https://www.googleapis.com/auth/drive.file", "https://www.googleapis.com/auth/drive.readonly"]
     )
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
+    return build("drive", "v3", credentials=creds)
 
-def drive_upload_file(path: Path) -> Optional[str]:
-    try:
-        service = _drive_service()
-        folder_id = os.getenv("GDRIVE_FOLDER_ID", "").strip()
-        media = MediaFileUpload(str(path), mimetype="text/csv", resumable=True)
-        file_metadata = {"name": path.name}
-        if folder_id:
-            file_metadata["parents"] = [folder_id]
-        file = service.files().create(body=file_metadata, media_body=media, fields="id").execute()
-        fid = file.get("id")
-        log(f"[Drive] 업로드 완료: {fid}")
-        return fid
-    except Exception as e:
-        log(f"[Drive] 업로드 실패 (무시): {e}")
-        return None
+def drive_find_prev_csv(service, prefix: str, today_name: str) -> Optional[Tuple[str, str]]:
+    # 오늘 파일 제외하고, prefix로 시작하는 최신 CSV 하나
+    q = f"'{GDRIVE_FOLDER_ID}' in parents and name contains '{prefix}' and mimeType='text/csv'"
+    files = service.files().list(q=q, orderBy="createdTime desc",
+                                 fields="files(id,name,createdTime)").execute().get("files", [])
+    for f in files:
+        if f["name"] != today_name:
+            return f["id"], f["name"]
+    return None
 
-def drive_find_latest_prev(prefix: str) -> Optional[Path]:
-    """Drive 안에서 prefix로 시작하고, 오늘 날짜 이전 파일 중 가장 최근 파일을 다운로드."""
-    try:
-        service = _drive_service()
-        folder_id = os.getenv("GDRIVE_FOLDER_ID", "").strip()
-        q = f"name contains '{prefix}'"
-        if folder_id:
-            q = f"({q}) and '{folder_id}' in parents"
-
-        results = service.files().list(
-            q=q,
-            fields="files(id, name, modifiedTime)",
-            orderBy="modifiedTime desc",
-            pageSize=50
-        ).execute()
-        files = results.get("files", [])
-
-        target = None
-        for f in files:
-            name = f["name"]
-            # 파일명에서 날짜 추출
-            m = re.search(r"(\d{4}-\d{2}-\d{2})", name)
-            if not m:
-                continue
-            d = dt.datetime.strptime(m.group(1), "%Y-%m-%d").date()
-            if d < TODAY:
-                target = f
-                break
-
-        if not target:
-            return None
-
-        out = DATA_DIR / target["name"]
-        with open(out, "wb") as fp:
-            req = _drive_service().files().get_media(fileId=target["id"]).execute()
-            fp.write(req)
-        log(f"[Drive] 전일 파일 다운로드: {out.name}")
-        return out
-    except Exception as e:
-        log(f"[Drive] 전일 탐색/다운로드 실패(무시): {e}")
-        return None
-
-
-# =========================
-# CSV IO
-# =========================
-def save_csv(items: List[Dict], prefix: str) -> Path:
-    path = DATA_DIR / f"{prefix}_{TODAY.isoformat()}.csv"
-    with path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["date", "rank", "brand", "product_name", "price", "url", "product_code"])
-        for it in items:
-            w.writerow([
-                TODAY.isoformat(),
-                it.get("rank"),
-                it.get("brand", ""),
-                it.get("name", ""),
-                it.get("price", 0),
-                it.get("url", ""),
-                it.get("product_code", ""),
-            ])
-    log(f"[CSV] 저장: {path}")
-    return path
-
-def load_rows(csv_path: Optional[Path]) -> List[Dict]:
-    if not csv_path or not csv_path.exists():
-        return []
+def drive_download_csv(service, file_id: str) -> List[Dict]:
+    request = service.files().get_media(fileId=file_id)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        status, done = downloader.next_chunk()
+    fh.seek(0)
+    text = fh.read().decode("utf-8", errors="ignore")
     rows = []
-    with csv_path.open("r", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            rows.append(row)
+    reader = csv.DictReader(io.StringIO(text))
+    for r in reader:
+        rows.append(r)
     return rows
 
+def drive_upload_csv(service, path: str, filename: str) -> Optional[str]:
+    meta = {"name": filename, "parents": [GDRIVE_FOLDER_ID]}
+    media = MediaFileUpload(path, mimetype="text/csv", resumable=True)
+    try:
+        f = service.files().create(body=meta, media_body=media, fields="id").execute()
+        return f.get("id")
+    except Exception as e:
+        print("[Drive] 업로드 실패:", e)
+        return None
 
 # =========================
-# 수집 (HTTP → 실패 시 Playwright)
+# Scraping (Playwright)
 # =========================
-def fetch_by_http(url: str, timeout: int = 15) -> List[Dict]:
-    """Qoo10 모바일 랭킹(뷰티) HTML 파싱 (정적). 필요 시 더보기/스크롤은 Playwright에서 담당."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-    }
-    res = requests.get(url, headers=headers, timeout=timeout)
-    if res.status_code != 200:
-        return []
-    soup = BeautifulSoup(res.text, "html.parser")
-    return parse_qoo10_mobile_cards(soup)
-
-def parse_qoo10_mobile_cards(soup: BeautifulSoup) -> List[Dict]:
-    """모바일 페이지 카드 파싱. (상위 일부만 뜰 수 있음. 최대 40~60개 정도)"""
-    items = []
-    cards = soup.select("ul#best_prd_list li a[href*='/item/']")
-    seen = set()
-    rank = 1
-    for a in cards:
-        href = a.get("href") or ""
-        if "/item/" not in href:
-            continue
-        pid = extract_pid(href)
-        if not pid or pid in seen:
-            continue
-        seen.add(pid)
-
-        name_el = a.select_one(".prd_txt, .name, .tit")
-        brand_el = a.select_one(".brand, .brand_name")
-        price_el = a.select_one(".price, .sale_price, .won.prc")
-
-        name = normalize_text(name_el.get_text(strip=True) if name_el else "")
-        brand = normalize_text(brand_el.get_text(strip=True) if brand_el else "")
-        pr = parse_price(price_el.get_text(strip=True) if price_el else "")
-
-        items.append({
-            "rank": rank,
-            "brand": brand,
-            "name": name,
-            "price": pr or 0,
-            "url": urllib.parse.urljoin("https://www.qoo10.jp", href),
-            "product_code": pid,
-        })
-        rank += 1
-    return items
-
-def fetch_by_playwright(url: str, target_count: int = 200) -> List[Dict]:
-    """모바일 페이지에서 스크롤/더보기 등을 통해 200개 근접 수집."""
+def fetch_qoo10() -> List[Dict]:
+    """
+    모바일 베스트셀러 페이지(뷰티: group_code=2)에서 200위까지 파싱
+    반환: [{rank, name, price, url, code}]
+    """
+    items: List[Dict] = []
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-        ctx = browser.new_context(viewport={"width": 390, "height": 844})
-        page = ctx.new_page()
-        page.goto(url, wait_until="networkidle", timeout=60_000)
+        browser = p.chromium.launch(headless=True, args=["--disable-dev-shm-usage"])
+        ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 15_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.2 Mobile/15E148 Safari/604.1"
+        context = browser.new_context(
+            user_agent=ua,
+            locale="ja-JP",
+            viewport={"width": 390, "height": 844},
+        )
+        page = context.new_page()
+        print("수집 시작:", QOO10_URL)
+        page.goto(QOO10_URL, wait_until="domcontentloaded", timeout=60_000)
 
-        # 최대한 아래로 스크롤하여 더 많은 카드 로드
-        last_h = 0
-        same_count = 0
-        for _ in range(40):
-            page.mouse.wheel(0, 4000)
-            time.sleep(0.6)
-            h = page.evaluate("document.body.scrollHeight")
-            if h == last_h:
-                same_count += 1
-                if same_count >= 3:
-                    break
-            else:
-                same_count = 0
-            last_h = h
+        # 간헐적 쿠키/팝업
+        for sel in ["button#onetrust-accept-btn-handler", "button[aria-label='close']", "button:has-text('同意')"]:
+            try:
+                if page.locator(sel).first.is_visible():
+                    page.locator(sel).first.click()
+                    time.sleep(0.5)
+            except:
+                pass
 
+        # 컨테이너 등장 대기
+        # 모바일 랭킹 목록에서 상품 a[href*="/item/"] 이 충분히 보일 때까지
+        page.wait_for_timeout(1000)
+        for _ in range(40):  # 약간 내려주며 로딩 안정화
+            page.evaluate("window.scrollBy(0, 1000)")
+            page.wait_for_timeout(150)
+        # 최종 파싱
         html = page.content()
         browser.close()
 
-    soup = BeautifulSoup(html, "html.parser")
-    items = parse_qoo10_mobile_cards(soup)
+    soup = BeautifulSoup(html, "lxml")
 
-    # 혹시 너무 적으면 링크 수집 보강 (다양한 컨테이너)
-    if len(items) < target_count:
-        extras = []
-        links = soup.select("a[href*='/item/']")
-        seen = {it["product_code"] for it in items}
-        for a in links:
-            href = a.get("href") or ""
-            pid = extract_pid(href)
-            if not pid or pid in seen:
-                continue
-            name = normalize_text(a.get_text(" ", strip=True))
-            if len(name) < 2:
-                continue
-            price_el = a.select_one(".price, .sale_price, .won.prc")
-            pr = parse_price(price_el.get_text(strip=True) if price_el else "")
-            extras.append({
-                "brand": "",
-                "name": name,
-                "price": pr or 0,
-                "url": urllib.parse.urljoin("https://www.qoo10.jp", href),
-                "product_code": pid,
-            })
-            seen.add(pid)
-            if len(items) + len(extras) >= target_count:
+    # a[href*="/item/"] 가 상품 상세로 연결됨
+    anchors = soup.select('a[href*="/item/"]')
+    # 중복 제거 (동일 카드 내 중복 앵커 제거 위한 href uniq)
+    seen = set()
+    cards = []
+    for a in anchors:
+        href = a.get("href", "")
+        if "/item/" not in href:
+            continue
+        if href in seen:
+            continue
+        # 주변에 가격/이름이 같이 있는지 확인 위해 카드(div/li) 상위로
+        seen.add(href)
+        cards.append(a)
+
+    def nearest_text(el, selectors: List[str]) -> str:
+        # a 태그 주변/부모에서 텍스트 탐색 (가격/상품명)
+        # 우선 부모 3단계까지 검색
+        cur = el
+        txt = ""
+        for up in range(0, 3):
+            parent = cur.parent if cur else None
+            if not parent:
                 break
-        # 순위 보정
-        rank = len(items) + 1
-        for it in extras:
-            it["rank"] = rank
-            rank += 1
-        items.extend(extras)
+            for sel in selectors:
+                cand = parent.select_one(sel)
+                if cand and cand.get_text(strip=True):
+                    return cand.get_text(" ", strip=True)
+            cur = parent
+        # 못 찾으면 엘리먼트 자체 텍스트
+        return el.get_text(" ", strip=True)
 
-    # 최종 순위 재정렬 (rank 필드 기준)
-    items = sorted(items, key=lambda x: x["rank"])[:target_count]
-    return items
-
-def fetch_products() -> List[Dict]:
-    log(f"수집 시작: {QOO10_URL}")
-    items = fetch_by_http(QOO10_URL)
-    if len(items) < 60:
-        log("[HTTP] 결과 적음 → Playwright 폴백 진입")
-        items = fetch_by_playwright(QOO10_URL, target_count=200)
-
-    log(f"수집 완료: {len(items)}")
-    if len(items) == 0:
-        raise RuntimeError("Qoo10 수집 결과 0건. 셀렉터/렌더링 점검 필요")
-    return items
-
-
-# =========================
-# 비교/분석
-# =========================
-def analyze(today_rows: List[Dict], prev_rows: List[Dict],
-            top_new_threshold: int = 30,
-            limit_rise: int = 3, limit_new: int = 3, limit_fall: int = 5) -> Tuple[List, List, List, int]:
-    """
-    - 급상승: prev에도 있고 today에도 있는 제품 중 rank 개선(prev - curr > 0) 큰 순 (tie: curr asc → prev asc → 이름)
-    - 뉴랭커: prev 없거나 prev_rank > threshold 이고 today_rank <= threshold → curr asc
-    - 급하락: prev/today 모두 있고 curr - prev > 0 → 내림차순, 상위 5
-    - 인&아웃 수: (인 + 아웃) 개수
-    """
-    def key_name(d): return d.get("product_name","")
-
-    def rows_to_map(rows):
-        mp = {}
-        for r in rows:
-            code = r.get("product_code") or ""
-            try:
-                mp[code] = {
-                    "rank": int(r.get("rank") or 9999),
-                    "name": r.get("product_name",""),
-                    "brand": r.get("brand",""),
-                    "url": r.get("url",""),
-                }
-            except:
-                pass
-        return mp
-
-    T = rows_to_map(today_rows)
-    P = rows_to_map(prev_rows)
-
-    rises = []
-    new_rankers = []
-    falls = []
-
-    # 급상승/하락 후보
-    for code, t in T.items():
-        if code in P:
-            curr = t["rank"]; prev = P[code]["rank"]
-            if prev > curr:
-                rises.append({
-                    "name": t["name"], "curr": curr, "prev": prev, "delta": prev - curr
-                })
-            elif curr > prev:
-                falls.append({
-                    "name": t["name"], "curr": curr, "prev": prev, "delta": curr - prev
-                })
-
-    rises.sort(key=lambda x: (-x["delta"], x["curr"], x["prev"], x["name"]))
-    falls.sort(key=lambda x: (-x["delta"], x["prev"], x["curr"], x["name"]))
-    rises = rises[:limit_rise]
-    falls = falls[:limit_fall]
-
-    # 뉴랭커
-    for code, t in T.items():
-        curr = t["rank"]
-        if curr <= top_new_threshold:
-            if (code not in P) or (P[code]["rank"] > top_new_threshold):
-                new_rankers.append({"name": t["name"], "curr": curr})
-    new_rankers.sort(key=lambda x: x["curr"])
-    new_rankers = new_rankers[:limit_new]
-
-    # 인/아웃 카운트
-    ins = 0; outs = 0
-    # in: prev>30 또는 미등장 → today<=30
-    for code, t in T.items():
-        curr = t["rank"]
-        if curr <= top_new_threshold:
-            if (code not in P) or (P[code]["rank"] > top_new_threshold):
-                ins += 1
-    # out: prev<=30 → today>30 또는 미등장
-    for code, p in P.items():
-        if p["rank"] <= top_new_threshold:
-            if (code not in T) or (T[code]["rank"] > top_new_threshold):
-                outs += 1
-
-    return rises, new_rankers, falls, (ins + outs)
-
-
-# =========================
-# Slack 포맷 빌더
-# =========================
-def line_top(rank: int, name: str, url: str, price: Optional[int], off_pct: Optional[int]) -> str:
-    txt = f"{rank}. <{url}|{name}>"
-    if price and price > 0:
-        txt += f" — ¥{price:,}"
-    if off_pct is not None and off_pct > 0:
-        txt += f" (↓{off_pct}%)"
-    return txt
-
-def build_slack(today_rows: List[Dict], rises, new_rankers, falls, inout_cnt: int) -> str:
-    title = f"*큐텐 재팬 뷰티 랭킹 — {TODAY.isoformat()}*"
-    # TOP 10
-    top10 = []
-    for r in today_rows:
-        try:
-            rk = int(r["rank"])
-        except:
-            continue
-        if rk > 10:
-            continue
-        name = r["product_name"]
-        url = r["url"]
-        price = int(r.get("price") or 0)
-
-        # 할인율은 CSV에 없으니 (모바일 카드에 표시가 일관되지 않아) 0으로 표시
-        # 필요 시 수집 단계에서 orig_price/percent를 넣어 확장 가능
-        off = None
-
-        top10.append(line_top(rk, name, url, price, off))
-
-    # 번역(옵션): TOP10 이름만
-    trans_lines = []
-    if ENABLE_JA2KO:
-        src_names = [re.sub(r"^(\d+)\.\s+<[^|]+\|", "", ln).split(">")[0] for ln in top10]
-        kos = translate_ja_to_ko_batch(src_names)
-        for i, ko in enumerate(kos):
-            if ko:
-                top10[i] = f"{top10[i]}\n{ko}"
-
-    # 급상승
-    sec_rise = ["- 해당 없음"] if not rises else [f"- {x['name']} {x['prev']}위 → {x['curr']}위 (↑{x['delta']})" for x in rises]
-    # 뉴랭커
-    sec_new = ["- 해당 없음"] if not new_rankers else [f"- {x['name']} NEW → {x['curr']}위" for x in new_rankers]
-    # 급하락 (최대 5개)
-    sec_fall = ["- 해당 없음"] if not falls else [f"- {x['name']} {x['prev']}위 → {x['curr']}위 (↓{x['delta']})" for x in falls]
-
-    # 전체 메시지
-    parts = [
-        title,
-        "",
-        "*TOP 10*",
-        *top10,
-        "",
-        "🔥 *급상승*",
-        *sec_rise,
-        "",
-        "🆕 *뉴랭커*",
-        *sec_new,
-        "",
-        "📉 *급하락*",
-        *sec_fall,
-        "",
-        "🔁 *랭크 인&아웃*",
-        f"{inout_cnt}개의 제품이 인&아웃 되었습니다.",
+    # 이름/가격 셀렉터 후보 (모바일에서 자주 보임)
+    name_selectors = [
+        ".sbj", ".tit", ".prd_tit", ".name", "p", "div.title", "span.title"
     ]
-    return "\n".join(parts)
+    price_selectors = [
+        ".prc", ".price", ".org", ".dq_price", ".won", "em", "strong", "b", "span"
+    ]
 
+    rank = 1
+    for a in cards:
+        url = a.get("href", "")
+        code = extract_code_from_url(url)
+        raw_name = nearest_text(a, name_selectors)
+        name = clean_name(raw_name)
+        raw_price = nearest_text(a, price_selectors)
+        price = extract_price(raw_price)
 
-# =========================
-# 파이프라인
-# =========================
-def qoo10_pipeline(items: List[Dict]):
-    log(f"[QOO10] collected items: {len(items)}")
-    (DATA_DIR / "debug_items.json").write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+        if not name or not price or not code:
+            continue
 
-    if len(items) == 0:
-        raise RuntimeError("QOO10 수집 결과가 0건입니다. 셀렉터/렌더링 점검 필요")
+        items.append({
+            "rank": rank,
+            "name": name,
+            "price": price,
+            "url": url,
+            "code": code
+        })
+        rank += 1
+        if rank > TOP_LIMIT_SAVE:
+            break
 
-    # 정규화 + PID
-    for it in items:
-        it["name"] = normalize_text(it.get("name",""))
-        it["brand"] = normalize_text(it.get("brand",""))
-        it["product_code"] = extract_pid(it.get("url",""))
-
-    # CSV 저장
-    csv_path = save_csv(items, prefix="큐텐재팬_뷰티_랭킹")
-
-    # Drive 업로드 (무시 가능)
-    drive_upload_file(csv_path)
-
-    # 오늘/전일 로드
-    today_rows = load_rows(csv_path)
-    prev_path  = drive_find_latest_prev("큐텐재팬_뷰티_랭킹_")
-    prev_rows  = load_rows(prev_path) if prev_path else []
-
-    rises, new_rankers, falls, inout_cnt = analyze(today_rows, prev_rows,
-                                                   top_new_threshold=30,
-                                                   limit_rise=3, limit_new=3, limit_fall=5)
-    msg = build_slack(today_rows, rises, new_rankers, falls, inout_cnt)
-    slack_post(msg)
-
+    return items
 
 # =========================
-# main
+# Compare
+# =========================
+def compare(today: List[Dict], prev: List[Dict]):
+    # code 기준으로 비교
+    prev_map = {r.get("code"): r for r in prev if r.get("code")}
+    today_map = {r.get("code"): r for r in today if r.get("code")}
+
+    rising = []
+    falling = []
+    newcomers = []
+    outs = []
+
+    # 급상승/급하락: 양쪽 모두에 존재하는 대상 중 상위 TOP_LIMIT_COMPARE 내에서만 비교
+    for t in today:
+        c = t["code"]
+        if c in prev_map:
+            pr = int(prev_map[c].get("rank", 9999))
+            tr = int(t["rank"])
+            if pr <= TOP_LIMIT_COMPARE and tr <= TOP_LIMIT_COMPARE:
+                diff = pr - tr  # +면 상승
+                if diff > 0:
+                    rising.append({
+                        "name": t["name"], "curr": tr, "prev": pr, "diff": diff
+                    })
+                elif diff < 0:
+                    falling.append({
+                        "name": t["name"], "curr": tr, "prev": pr, "diff": -diff
+                    })
+        else:
+            # 뉴랭커: 전일 Top30 밖(또는 미등장) → 당일 Top30 진입
+            if int(t["rank"]) <= TOP_LIMIT_COMPARE:
+                newcomers.append({
+                    "name": t["name"], "curr": int(t["rank"])
+                })
+
+    # 아웃: 전일 Top30인데 오늘 Top30 밖
+    for p in prev:
+        c = p.get("code")
+        if not c:
+            continue
+        pr = int(p.get("rank", 9999))
+        if pr <= TOP_LIMIT_COMPARE and c not in today_map:
+            outs.append({"name": p["name"], "prev": pr})
+
+    # 정렬 및 제한
+    rising.sort(key=lambda x: (-x["diff"], x["curr"], x["prev"], x["name"]))
+    falling.sort(key=lambda x: (-x["diff"], x["prev"], x["curr"], x["name"]))
+    newcomers.sort(key=lambda x: (x["curr"], x["name"]))
+
+    rising = rising[:3]
+    newcomers = newcomers[:3]
+    falling = falling[:5]
+
+    inout_cnt = len(newcomers) + len(outs)
+    return rising, newcomers, falling, inout_cnt
+
+# =========================
+# Slack
+# =========================
+def post_slack(payload: Dict):
+    if not SLACK_WEBHOOK_URL:
+        print("[Slack] WEBHOOK 미설정, 출력만")
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    import requests
+    r = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=20)
+    print("[Slack] status:", r.status_code)
+
+def slack_blocks(title: str, today: List[Dict], rising, newcomers, falling, inout_cnt) -> Dict:
+    def top10_lines():
+        lines = []
+        for i, r in enumerate(today[:10], 1):
+            price = f"¥{format(r['price'], ',')}"
+            # Slack 링크: <url|text>
+            line = f"{i}. <{r['url']}|{r['name']}> — {price}"
+            lines.append(line)
+        return "\n".join(lines) if lines else "- 해당 없음"
+
+    def section_lines(lst, kind):
+        rows = []
+        if kind == "rising":
+            for x in lst:
+                rows.append(f"- {x['name']} {x['prev']}위 → {x['curr']}위 (↑{x['diff']})")
+        elif kind == "new":
+            for x in lst:
+                rows.append(f"- {x['name']} NEW → {x['curr']}위")
+        elif kind == "fall":
+            for x in lst:
+                rows.append(f"- {x['name']} {x['prev']}위 → {x['curr']}위 (↓{x['diff']})")
+        return "\n".join(rows) if rows else "- 해당 없음"
+
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*{title}*"}},
+        {"type": "divider"},
+        {"type": "section", "text": {"type": "mrkdwn", "text": "*TOP 10*"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": top10_lines()}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": "*🔥 급상승*"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": section_lines(rising, "rising")}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": "*🆕 뉴랭커*"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": section_lines(newcomers, "new")}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": "*📉 급하락*"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": section_lines(falling, "fall")}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": "*📦 랭크 인&아웃*"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"{inout_cnt}개의 제품이 인&아웃 되었습니다."}},
+    ]
+    return {"blocks": blocks}
+
+# =========================
+# Main
 # =========================
 def main():
-    try:
-        items = fetch_products()
-        qoo10_pipeline(items)
-    except Exception as e:
-        log("[에러] " + repr(e))
-        traceback.print_exc()
-        raise
+    ensure_dir(DATA_DIR)
+    today = kst_today()
+    ymd = today.strftime("%Y-%m-%d")
+    title = f"큐텐 재팬 뷰티 랭킹 — {ymd}"
+
+    # 1) 수집
+    products = fetch_qoo10()
+    if not products:
+        raise RuntimeError("Qoo10 수집 결과 0건. 셀렉터/렌더링 점검 필요")
+
+    # 순위 보정(1..N)
+    for i, r in enumerate(products, 1):
+        r["rank"] = i
+
+    # CSV 저장 (data/)
+    csv_name = f"큐텐재팬_뷰티_랭킹_{ymd}.csv"
+    csv_path = os.path.join(DATA_DIR, csv_name)
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["date", "rank", "name", "price", "url", "code"])
+        for r in products:
+            writer.writerow([ymd, r["rank"], r["name"], r["price"], r["url"], r["code"]])
+
+    print("[저장] CSV:", csv_path)
+
+    # 2) Drive 업로드 + 전일 파일 가져와 비교
+    rising = newcomers = falling = []
+    inout_cnt = 0
+
+    service = drive_client()
+    if service and GDRIVE_FOLDER_ID:
+        file_id = drive_upload_csv(service, csv_path, csv_name)
+        if file_id:
+            print("[Drive] 업로드 완료:", csv_name)
+        else:
+            print("[Drive] 업로드 실패")
+
+        # 전일 파일(최신 이전본) 검색
+        prev = drive_find_prev_csv(service, "큐텐재팬_뷰티_랭킹_", csv_name)
+        prev_rows = []
+        if prev:
+            pid, pname = prev
+            try:
+                prev_rows = drive_download_csv(service, pid)
+            except Exception as e:
+                print("[Drive] 이전 CSV 다운로드 실패:", e)
+
+        prev_items = []
+        for r in prev_rows:
+            try:
+                prev_items.append({
+                    "rank": int(r.get("rank", "9999")),
+                    "name": r.get("name", ""),
+                    "price": int(r.get("price", "0") or 0),
+                    "url": r.get("url", ""),
+                    "code": r.get("code", ""),
+                })
+            except:
+                pass
+
+        rising, newcomers, falling, inout_cnt = compare(products, prev_items)
+
+    # 3) Slack 메시지 전송
+    payload = slack_blocks(title, products, rising, newcomers, falling, inout_cnt)
+    post_slack(payload)
 
 if __name__ == "__main__":
     main()
