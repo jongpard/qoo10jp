@@ -11,10 +11,6 @@ Slack 포맷:
  📉 급하락 (5개만, 번역)
  OUT (최대 10개, 번역 없음)
  🔄 랭크 인&아웃 (개수만)
-
-Drive:
- - GOOGLE_SERVICE_ACCOUNT_JSON 있으면 서비스계정 로그인
- - 아니면 GOOGLE_CLIENT_ID/SECRET/REFRESH_TOKEN OAuth 로그인
 """
 
 import os, re, io, math, pytz, traceback, urllib.parse
@@ -47,14 +43,27 @@ def slack_escape(s): return (s or "").replace("&","&amp;").replace("<","&lt;").r
 
 # ---------- 이름/괄호/노이즈 (슬랙 표시 전용) ----------
 BRACKETS_PAT = re.compile(r"(\[.*?\]|【.*?】|（.*?）|\(.*?\))")
+# 툴팁/쿠폰/단위/광고성 토큰 제거
 NOISE_TOKENS_RE = re.compile(
-    r"(TooltipBtn|クーポン発行|クーポン|ショップ券|送料無料|即日|OFF|%|レビュー|ポイント|GIFT付|公式|セット|選べる|個|本|枚|ml|g)\s*",
-    re.I
+    r"(TooltipBtn|クーポン発行|クーポン|ショップ券|送料無料|即日|OFF|％|%|レビュー|ポイント|GIFT付|公式|セット|選べる|個|本|枚|ml|g)\s*",
+    re.I,
 )
+JP_CHAR_RE = re.compile(r"[一-龯ぁ-ゔァ-ヴー々〆ヵヶｦ-ﾟ]")
+
 def strip_brackets_for_slack(s: str) -> str:
     s = clean_text(BRACKETS_PAT.sub("", s or ""))
-    # 제품명에서 흔한 판매/툴팁 문구 제거 (과제: 과도 제거 방지를 위해 한 번만)
     return clean_text(NOISE_TOKENS_RE.sub(" ", s))
+
+def score_title(s: str) -> int:
+    """일본어(가나/한자) 글자수를 가중치로 스코어링"""
+    if not s: return -1
+    low = s.lower()
+    # 브랜드/쇼핑몰명 같은 잡텍스트 필터
+    bads = ("wish", "qoo10", "shop", "ショップ", "公式", "ストア", "store")
+    if any(b in low for b in bads): return -1
+    s = strip_brackets_for_slack(s)
+    j = len(JP_CHAR_RE.findall(s))
+    return j * 3 + len(s)
 
 # ---------- 가격/할인 ----------
 YEN_AMOUNT_RE = re.compile(r"(?:¥|)(\d{1,3}(?:,\d{3})+|\d+)\s*円")
@@ -97,28 +106,56 @@ def normalize_href(href: str) -> str:
     if href.startswith("/"):  return "https://www.qoo10.jp" + href
     return href
 
+def choose_product_title(li: BeautifulSoup, a: BeautifulSoup) -> str:
+    """a 텍스트가 'Wish' 등일 때, li 내부에서 가장 그럴듯한 제품명 선택"""
+    cands = []
+
+    # 1) anchor title/텍스트
+    tit = a.get("title")
+    if tit: cands.append(tit)
+    cands.append(a.get_text(" ", strip=True))
+
+    # 2) 대표 이미지 alt
+    for img in li.select("img[alt]"):
+        cands.append(img.get("alt", ""))
+
+    # 3) 자주 쓰이는 타이틀 요소
+    for sel in [".tit", ".title", ".name", ".prd_tit", ".prd_name", ".tb-tit", ".goods_name"]:
+        for el in li.select(sel):
+            cands.append(el.get_text(" ", strip=True))
+
+    # 4) 블록 텍스트에서 후보 분리
+    block = clean_text(li.get_text(" ", strip=True))
+    for seg in re.split(r"[|•/▶▷›»·・\-–—]+", block):
+        cands.append(seg)
+
+    # 스코어링
+    best, best_sc = "", -1
+    for s in cands:
+        s = clean_text(s)
+        sc = score_title(s)
+        if sc > best_sc:
+            best_sc, best = sc, s
+    return best or clean_text(a.get_text(" ", strip=True))
+
 # ---------- Parse (랭킹 컨테이너 고정) ----------
 def _find_ranking_list(soup: BeautifulSoup):
-    """
-    페이지에서 'Goods.aspx' 링크가 10개 이상 포함된 UL/OL 중 가장 큰 블록을 랭킹으로 간주
-    """
+    """'Goods.aspx'류 링크가 10개 이상 포함된 UL/OL 중 가장 큰 블록을 랭킹으로 간주"""
     candidates = []
     for ul in soup.select("ul,ol"):
         cnt = len(ul.select("a[href*='Goods.aspx'], a[href*='/Item/'], a[href*='/item/'], a[href*='/goods']"))
         if cnt >= 10:
             candidates.append((cnt, ul))
-    if not candidates:
-        return None
+    if not candidates: return None
     candidates.sort(key=lambda x: -x[0])
     return candidates[0][1]
 
 def parse_mobile_html(html: str) -> List[Product]:
     soup = BeautifulSoup(html, "lxml")
-    root = _find_ranking_list(soup) or soup  # 최악의 경우 전체에서
+    root = _find_ranking_list(soup) or soup
     items: List[Product] = []
     seen = set()
 
-    # 랭킹 컨테이너의 직계/하위 li를 순회 → 순서가 곧 순위
     lis = root.select(":scope > li") or root.select("li")
     for li in lis:
         a = li.select_one("a[href*='Goods.aspx'], a[href*='/Item/'], a[href*='/item/'], a[href*='/goods']")
@@ -130,8 +167,9 @@ def parse_mobile_html(html: str) -> List[Product]:
         if key in seen: continue
         seen.add(key)
 
-        name = clean_text(a.get_text(" ", strip=True))
+        name = choose_product_title(li, a)  # ← 핵심
         sale, _, pct = compute_prices(block)
+
         items.append(Product(len(items)+1, "", name, sale, pct, href, code))
         if len(items) >= MAX_RANK: break
     return items
@@ -178,25 +216,20 @@ def fetch_by_playwright() -> List[Product]:
         try: page.wait_for_load_state("networkidle", timeout=25_000)
         except: pass
 
-        # 페이지에서 랭킹 UL/OL을 찾아서 각 LI의 첫 상품 링크만 추출 (순서 보존)
         rows = page.evaluate("""
             () => {
               function findRankingList() {
                 const lists = Array.from(document.querySelectorAll('ul,ol'));
-                let best = null;
-                let bestCnt = 0;
+                let best=null, bestCnt=0;
                 for (const el of lists) {
                   const cnt = el.querySelectorAll("a[href*='Goods.aspx'], a[href*='/Item/'], a[href*='/item/'], a[href*='/goods']").length;
                   if (cnt >= 10 && cnt > bestCnt) { best = el; bestCnt = cnt; }
                 }
-                return best;
+                return best || document;
               }
-              const root = findRankingList() || document;
-              const lis = root.querySelectorAll(':scope > li');
-              const out = [];
-              const seen = new Set();
-              const list = lis.length ? lis : root.querySelectorAll('li');
-              let rank = 1;
+              const root = findRankingList();
+              const list = root.querySelectorAll(':scope > li').length ? root.querySelectorAll(':scope > li') : root.querySelectorAll('li');
+              const out = []; const seen = new Set(); let rank = 1;
               for (const li of list) {
                 const a = li.querySelector("a[href*='Goods.aspx'], a[href*='/Item/'], a[href*='/item/'], a[href*='/goods']");
                 if (!a) continue;
@@ -204,8 +237,7 @@ def fetch_by_playwright() -> List[Product]:
                 const name = (a.textContent || '').replace(/\\s+/g,' ').trim();
                 const block = (li.innerText || '').replace(/\\s+/g,' ').trim();
                 const key = href + '|' + name;
-                if (seen.has(key)) continue;
-                seen.add(key);
+                if (seen.has(key)) continue; seen.add(key);
                 out.push({href, name, block, rank: rank++});
                 if (out.length >= 500) break;
               }
@@ -218,12 +250,25 @@ def fetch_by_playwright() -> List[Product]:
     seen = set()
     for row in rows:
         href = normalize_href(row.get("href",""))
-        name = clean_text(row.get("name",""))
         block = clean_text(row.get("block",""))
+        name_raw = clean_text(row.get("name",""))
+
+        # BeautifulSoup 없이도 이름 보정 필요 → 간단 필터
+        name = strip_brackets_for_slack(name_raw)
+        if score_title(name) < 0:
+            # name 이 'Wish' 같은 경우, block에서 재선택
+            segs = re.split(r"[|•/▶▷›»·・\-–—]+", block)
+            best, best_sc = "", -1
+            for s in segs:
+                sc = score_title(s)
+                if sc > best_sc: best_sc, best = sc, clean_text(s)
+            name = best or name_raw
+
         code = extract_goods_code(href, block)
         key = code or href
         if key in seen: continue
         seen.add(key)
+
         sale, _, pct = compute_prices(block)
         items.append(Product(len(items)+1,"",name,sale,pct,href,code))
         if len(items) >= MAX_RANK: break
@@ -395,7 +440,7 @@ def drive_upload_csv(svc,folder_id,name,df):
     from googleapiclient.http import MediaIoBaseUpload
     buf=io.BytesIO(); df.to_csv(buf,index=False,encoding="utf-8-sig"); buf.seek(0)
     media=MediaIoBaseUpload(buf,mimetype="text/csv",resumable=False)
-    # create/update 에는 includeItemsFromAllDrives X
+    # create/update에는 includeItemsFromAllDrives 미사용
     q=f"name='{name}' and '{folder_id}' in parents and trashed=false"
     res=svc.files().list(q=q,fields="files(id)",supportsAllDrives=True).execute()
     if res.get("files"):
@@ -440,7 +485,6 @@ def main():
         if svc and folder:
             drive_upload_csv(svc,folder,today_file,df_today)
             df_prev=drive_download_csv(svc,folder,yest_file)
-        # 로컬 백업 비교
         if df_prev is None:
             local_prev=os.path.join("data",yest_file)
             if os.path.exists(local_prev):
