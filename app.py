@@ -7,12 +7,11 @@ Qoo10 JP Beauty Bestsellers (g=2)
 
 Slack 포맷(요청 사양):
 섹션 순서: TOP 10 → 급상승 → 뉴랭커 → 급하락(5개) → 랭크 인&아웃(개수만)
-TOP10 라인:  "{순위}. {브랜드 제품명} — ₩{가격} (↓{할인%})"
+TOP10:  "{순위}. {브랜드 제품명} — ₩{가격} (↓{할인%})"
 급상승/급하락/뉴랭커:
   - "- {브랜드 제품명} 71위 → 7위 (↑64)"
   - "- {브랜드 제품명} NEW → 19위"
   - "- {브랜드 제품명} 23위 → OUT"
-정렬/선정 기준은 코드 내 주석 참조.
 """
 
 import os, re, io, math, pytz, traceback
@@ -33,8 +32,8 @@ MOBILE_URLS = [
 ]
 DESKTOP_URL = "https://www.qoo10.jp/gmkt.inc/Bestsellers/?g=2"
 MAX_RANK = int(os.getenv("QOO10_MAX_RANK", "200"))          # 수집 상한
-MAX_FALLING = 5                                              # 급하락 표기 상한(고정 5)
-MAX_OUT = int(os.getenv("QOO10_MAX_OUT", "10"))              # OUT 표기 상한(기본 10)
+MAX_FALLING = 5                                              # 급하락 표기 상한
+MAX_OUT = int(os.getenv("QOO10_MAX_OUT", "10"))              # OUT 표기 상한
 
 # ---------- time/utils ----------
 def now_kst(): return dt.datetime.now(KST)
@@ -334,11 +333,7 @@ def slack_post(text: str):
     url = os.getenv("SLACK_WEBHOOK_URL")
     if not url:
         print("[경고] SLACK_WEBHOOK_URL 미설정 → 콘솔 출력\n", text); return
-    payload = {
-        "text": text,
-        "unfurl_links": False,
-        "unfurl_media": False,
-    }
+    payload = {"text": text, "unfurl_links": False, "unfurl_media": False}
     r = requests.post(url, json=payload, timeout=20)
     if r.status_code >= 300:
         print("[Slack 실패]", r.status_code, r.text)
@@ -396,16 +391,16 @@ def translate_ja_to_ko_batch(lines: List[str]) -> List[str]:
 
 # ---------- compare/message ----------
 def to_dataframe(products: List[Product], date_str: str) -> pd.DataFrame:
-    def safe_name(p: Product) -> str:
-        nm = strip_brackets_for_slack(clean_text(p.title))
-        br = clean_text(p.brand)
-        nm = f"{br} {nm}" if br and not nm.lower().startswith(br.lower()) else nm
-        return nm or "상품"
+    """
+    CSV에는 원문(괄호 포함)을 그대로 저장한다.
+    - brand: remove_official_token만 적용 (괄호 보존)
+    - product_name: title 원문 저장 (괄호 보존)
+    """
     return pd.DataFrame([{
         "date": date_str,
         "rank": p.rank,
-        "brand": p.brand,
-        "product_name": safe_name(p),
+        "brand": clean_text(p.brand),         # 괄호 보존
+        "product_name": clean_text(p.title),  # 괄호 보존
         "price": p.price,
         "orig_price": p.orig_price,
         "discount_percent": p.discount_percent,
@@ -416,14 +411,19 @@ def to_dataframe(products: List[Product], date_str: str) -> pd.DataFrame:
 def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> Dict[str, List[str]]:
     S = {"top10": [], "rising": [], "newcomers": [], "falling": [], "outs": [], "inout_count": 0}
 
+    # 슬랙 표시용 이름(여기에서만 괄호 제거)
     def plain_name(row):
-        return clean_text(row.get("product_name",""))
+        nm = strip_brackets_for_slack(clean_text(row.get("product_name","")))
+        br = clean_text(row.get("brand",""))
+        if br and not nm.lower().startswith(br.lower()):
+            nm = f"{br} {nm}"
+        return nm.strip() or "상품"
 
     def link_name(row):
-        return f"<{row['url']}|{slack_escape(plain_name(row) or '상품')}>"
+        return f"<{row['url']}|{slack_escape(plain_name(row))}>"
 
     def interleave_with_ko(lines: List[str], jp_texts: List[str], do_translate=True) -> List[str]:
-        if not do_translate:  # 번역 비활성(OUT에서 사용)
+        if not do_translate:  # OUT에서는 번역 생략(길이 절감)
             return lines
         kos = translate_ja_to_ko_batch(jp_texts)
         out = []
@@ -433,11 +433,11 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
                 out.append(kos[i])
         return out
 
-    # ---- TOP 10 (당일 1~10위)
+    # ---------- TOP 10 (당일 1~10위)
     top10 = df_today.dropna(subset=["rank"]).sort_values("rank").head(10)
     jp_for_tr, top10_lines = [], []
     for _, r in top10.iterrows():
-        nm = plain_name(r)
+        nm = plain_name(r)  # 슬랙 표시는 괄호 제거
         jp_for_tr.append(nm)
         tail = f" (↓{int(r['discount_percent'])}%)" if pd.notnull(r.get("discount_percent")) else ""
         top10_lines.append(f"{int(r['rank'])}. {link_name(r)} — {fmt_currency_krw_like(r['price'])}{tail}")
@@ -446,10 +446,13 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     if df_prev is None or not len(df_prev):
         return S
 
-    # ---- 비교용 키
+    # ---------- 비교용 키 (product_code 우선, 없으면 URL)
     def keyify(df):
         df = df.copy()
-        df["key"] = df.apply(lambda x: x["product_code"] if (pd.notnull(x.get("product_code")) and str(x.get("product_code")).strip()) else x["url"], axis=1)
+        df["key"] = df.apply(
+            lambda x: x["product_code"] if (pd.notnull(x.get("product_code")) and str(x.get("product_code")).strip())
+            else x["url"], axis=1
+        )
         df.set_index("key", inplace=True)
         return df
 
@@ -467,7 +470,7 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
         elif delta < 0: return f"- {name_link} {prev_rank}위 → {curr_rank}위 (↓{abs(delta)})", abs(delta)
         else:           return f"- {name_link} {prev_rank}위 → {curr_rank}위 (변동없음)", 0
 
-    # ---- 급상승
+    # ---------- 급상승
     rising_pack = []
     for k in common:
         pr, cr = int(p30.loc[k,"rank"]), int(t30.loc[k,"rank"])
@@ -480,17 +483,17 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     rising_jp    = [e[5] for e in rising_pack[:3]]
     S["rising"] = interleave_with_ko(rising_lines, rising_jp, do_translate=True)
 
-    # ---- 뉴랭커
+    # ---------- 뉴랭커
     newcom = []
     for k in new:
         cr = int(t30.loc[k,"rank"])
         newcom.append((cr, f"- {link_name(t30.loc[k])} NEW → {cr}위", plain_name(t30.loc[k])))
-    newcom.sort(key=lambda x: x[0])
+    newcom.sort(key=lambda x: x[0])  # 오늘 순위 오름차순
     new_lines = [e[1] for e in newcom[:3]]
     new_jp    = [e[2] for e in newcom[:3]]
     S["newcomers"] = interleave_with_ko(new_lines, new_jp, do_translate=True)
 
-    # ---- 급하락
+    # ---------- 급하락
     falling_pack = []
     for k in common:
         pr, cr = int(p30.loc[k,"rank"]), int(t30.loc[k,"rank"])
@@ -503,17 +506,16 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     falling_jp    = [e[5] for e in falling_pack[:MAX_FALLING]]
     S["falling"] = interleave_with_ko(falling_lines, falling_jp, do_translate=True)
 
-    # ---- OUT (전일 Top30 → 당일 Top30 밖)
+    # ---------- OUT (전일 Top30 → 당일 Top30 밖)
     outs_pack = []
     for k in sorted(list(out)):
         pr = int(p30.loc[k,"rank"])
         outs_pack.append((pr, line_move(link_name(p30.loc[k]), pr, None)[0], plain_name(p30.loc[k])))
     outs_pack.sort(key=lambda x: x[0])  # 전일 순위 오름차순
     outs_lines = [e[1] for e in outs_pack[:MAX_OUT]]
-    # OUT은 번역 미삽입(길이 절감)
-    S["outs"] = interleave_with_ko(outs_lines, [], do_translate=False)
+    S["outs"] = interleave_with_ko(outs_lines, [], do_translate=False)  # 번역 생략
 
-    # ---- 인&아웃 카운트
+    # ---------- 인&아웃 개수
     S["inout_count"] = len(new) + len(out)
     return S
 
@@ -566,22 +568,21 @@ def main():
     df_today.to_csv(os.path.join("data", file_today), index=False, encoding="utf-8-sig")
     print("로컬 저장:", file_today)
 
-    # Google Drive
+    # Google Drive (전일 비교용)
     df_prev = None
-    try:
-        folder = os.getenv("GDRIVE_FOLDER_ID","").strip()
-        if folder:
-            from googleapiclient.discovery import build  # import check
+    folder = normalize_folder_id(os.getenv("GDRIVE_FOLDER_ID",""))
+    if folder:
+        try:
             svc = build_drive_service()
             drive_upload_csv(svc, folder, file_today, df_today)
             print("Google Drive 업로드 완료:", file_today)
             df_prev = drive_download_csv(svc, folder, file_yesterday)
             print("전일 CSV", "미발견" if df_prev is None else "성공")
-        else:
-            print("[경고] GDRIVE_FOLDER_ID 미설정 → 드라이브 업로드/전일 비교 생략")
-    except Exception as e:
-        print("Google Drive 처리 오류:", e)
-        traceback.print_exc()
+        except Exception as e:
+            print("Google Drive 처리 오류:", e)
+            traceback.print_exc()
+    else:
+        print("[경고] GDRIVE_FOLDER_ID 미설정 → 드라이브 업로드/전일 비교 생략")
 
     S = build_sections(df_today, df_prev)
     msg = build_slack_message(date_str, S)
