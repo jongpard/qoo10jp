@@ -45,10 +45,16 @@ def build_filename(d): return f"큐텐재팬_뷰티_랭킹_{d}.csv"
 def clean_text(s): return re.sub(r"\s+", " ", (s or "")).strip()
 def slack_escape(s): return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
-# ---------- 이름/괄호 (슬랙 표시 전용) ----------
+# ---------- 이름/괄호/노이즈 (슬랙 표시 전용) ----------
 BRACKETS_PAT = re.compile(r"(\[.*?\]|【.*?】|（.*?）|\(.*?\))")
+NOISE_TOKENS_RE = re.compile(
+    r"(TooltipBtn|クーポン発行|クーポン|ショップ券|送料無料|即日|OFF|%|レビュー|ポイント|GIFT付|公式|セット|選べる|個|本|枚|ml|g)\s*",
+    re.I
+)
 def strip_brackets_for_slack(s: str) -> str:
-    return clean_text(BRACKETS_PAT.sub("", s or ""))
+    s = clean_text(BRACKETS_PAT.sub("", s or ""))
+    # 제품명에서 흔한 판매/툴팁 문구 제거 (과제: 과도 제거 방지를 위해 한 번만)
+    return clean_text(NOISE_TOKENS_RE.sub(" ", s))
 
 # ---------- 가격/할인 ----------
 YEN_AMOUNT_RE = re.compile(r"(?:¥|)(\d{1,3}(?:,\d{3})+|\d+)\s*円")
@@ -76,7 +82,7 @@ class Product:
     price: Optional[int]; discount_percent: Optional[int]
     url: str; product_code: str = ""
 
-# ---------- Parse ----------
+# ---------- helpers ----------
 def extract_goods_code(url: str, block_text=""):
     if not url: return ""
     m = re.search(r"(?:[?&](?:goods?_?code|goodsno)=(\d+))", url, re.I)
@@ -86,24 +92,46 @@ def extract_goods_code(url: str, block_text=""):
     m3 = re.search(r"商品番号\s*[:：]\s*(\d+)", block_text or "")
     return m3.group(1) if m3 else ""
 
+def normalize_href(href: str) -> str:
+    if href.startswith("//"): return "https:" + href
+    if href.startswith("/"):  return "https://www.qoo10.jp" + href
+    return href
+
+# ---------- Parse (랭킹 컨테이너 고정) ----------
+def _find_ranking_list(soup: BeautifulSoup):
+    """
+    페이지에서 'Goods.aspx' 링크가 10개 이상 포함된 UL/OL 중 가장 큰 블록을 랭킹으로 간주
+    """
+    candidates = []
+    for ul in soup.select("ul,ol"):
+        cnt = len(ul.select("a[href*='Goods.aspx'], a[href*='/Item/'], a[href*='/item/'], a[href*='/goods']"))
+        if cnt >= 10:
+            candidates.append((cnt, ul))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: -x[0])
+    return candidates[0][1]
+
 def parse_mobile_html(html: str) -> List[Product]:
     soup = BeautifulSoup(html, "lxml")
-    # 모바일/데스크톱 공통 패턴 모두 커버
-    anchors = soup.select(
-        "a[href*='Goods.aspx'], a[href*='/Item/'], a[href*='/item/'], a[href*='/goods']"
-    )
-    items: List[Product] = []; seen = set()
-    for a in anchors:
-        href = a.get("href",""); 
-        if not href: continue
-        container = a.find_parent("li") or a.find_parent("div")
-        block_text = clean_text(container.get_text(" ", strip=True)) if container else ""
-        if href.startswith("//"): href = "https:" + href
-        elif href.startswith("/"): href = "https://www.qoo10.jp" + href
-        code = extract_goods_code(href, block_text); key = code or href
-        if key in seen: continue; seen.add(key)
+    root = _find_ranking_list(soup) or soup  # 최악의 경우 전체에서
+    items: List[Product] = []
+    seen = set()
+
+    # 랭킹 컨테이너의 직계/하위 li를 순회 → 순서가 곧 순위
+    lis = root.select(":scope > li") or root.select("li")
+    for li in lis:
+        a = li.select_one("a[href*='Goods.aspx'], a[href*='/Item/'], a[href*='/item/'], a[href*='/goods']")
+        if not a: continue
+        href = normalize_href(a.get("href",""))
+        block = clean_text(li.get_text(" ", strip=True))
+        code = extract_goods_code(href, block)
+        key = code or href
+        if key in seen: continue
+        seen.add(key)
+
         name = clean_text(a.get_text(" ", strip=True))
-        sale, _, pct = compute_prices(block_text)
+        sale, _, pct = compute_prices(block)
         items.append(Product(len(items)+1, "", name, sale, pct, href, code))
         if len(items) >= MAX_RANK: break
     return items
@@ -119,7 +147,7 @@ def fetch_by_http_mobile()->List[Product]:
         try:
             r = requests.get(url, headers=headers, timeout=20); r.raise_for_status()
             items = parse_mobile_html(r.text)
-            if len(items) >= 10: 
+            if len(items) >= 10:
                 print(f"[HTTP 모바일] {url} → {len(items)}개")
                 return items
         except Exception as e:
@@ -149,34 +177,54 @@ def fetch_by_playwright() -> List[Product]:
         page.goto(DESKTOP_URL, wait_until="domcontentloaded", timeout=60_000)
         try: page.wait_for_load_state("networkidle", timeout=25_000)
         except: pass
-        data = page.evaluate("""
+
+        # 페이지에서 랭킹 UL/OL을 찾아서 각 LI의 첫 상품 링크만 추출 (순서 보존)
+        rows = page.evaluate("""
             () => {
-              const as = Array.from(document.querySelectorAll(
-                "a[href*='Goods.aspx'], a[href*='/Item/'], a[href*='/item/'], a[href*='/goods']"
-              ));
-              const rows = []; const seen = new Set();
-              for (const a of as) {
+              function findRankingList() {
+                const lists = Array.from(document.querySelectorAll('ul,ol'));
+                let best = null;
+                let bestCnt = 0;
+                for (const el of lists) {
+                  const cnt = el.querySelectorAll("a[href*='Goods.aspx'], a[href*='/Item/'], a[href*='/item/'], a[href*='/goods']").length;
+                  if (cnt >= 10 && cnt > bestCnt) { best = el; bestCnt = cnt; }
+                }
+                return best;
+              }
+              const root = findRankingList() || document;
+              const lis = root.querySelectorAll(':scope > li');
+              const out = [];
+              const seen = new Set();
+              const list = lis.length ? lis : root.querySelectorAll('li');
+              let rank = 1;
+              for (const li of list) {
+                const a = li.querySelector("a[href*='Goods.aspx'], a[href*='/Item/'], a[href*='/item/'], a[href*='/goods']");
+                if (!a) continue;
                 const href = a.getAttribute('href') || '';
                 const name = (a.textContent || '').replace(/\\s+/g,' ').trim();
-                const li = a.closest('li') || a.closest('div');
-                if (!href || !name || !li) continue;
                 const block = (li.innerText || '').replace(/\\s+/g,' ').trim();
-                const key = href + "|" + name;
-                if (seen.has(key)) continue; seen.add(key);
-                rows.push({href, name, block});
+                const key = href + '|' + name;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                out.push({href, name, block, rank: rank++});
+                if (out.length >= 500) break;
               }
-              return rows.slice(0, 500);
+              return out;
             }
         """)
         context.close(); browser.close()
-    items: List[Product] = []; seen=set()
-    for row in data:
-        href=row.get("href",""); name=clean_text(row.get("name","")); block_text=clean_text(row.get("block",""))
-        if href.startswith("//"): href="https:" + href
-        elif href.startswith("/"): href="https://www.qoo10.jp" + href
-        code = extract_goods_code(href, block_text); key = code or href
-        if key in seen: continue; seen.add(key)
-        sale, _, pct = compute_prices(block_text)
+
+    items: List[Product] = []
+    seen = set()
+    for row in rows:
+        href = normalize_href(row.get("href",""))
+        name = clean_text(row.get("name",""))
+        block = clean_text(row.get("block",""))
+        code = extract_goods_code(href, block)
+        key = code or href
+        if key in seen: continue
+        seen.add(key)
+        sale, _, pct = compute_prices(block)
         items.append(Product(len(items)+1,"",name,sale,pct,href,code))
         if len(items) >= MAX_RANK: break
     print(f"[Playwright] {len(items)}개")
@@ -347,13 +395,14 @@ def drive_upload_csv(svc,folder_id,name,df):
     from googleapiclient.http import MediaIoBaseUpload
     buf=io.BytesIO(); df.to_csv(buf,index=False,encoding="utf-8-sig"); buf.seek(0)
     media=MediaIoBaseUpload(buf,mimetype="text/csv",resumable=False)
+    # create/update 에는 includeItemsFromAllDrives X
     q=f"name='{name}' and '{folder_id}' in parents and trashed=false"
-    res=svc.files().list(q=q,fields="files(id)",supportsAllDrives=True,includeItemsFromAllDrives=True).execute()
+    res=svc.files().list(q=q,fields="files(id)",supportsAllDrives=True).execute()
     if res.get("files"):
         fid=res["files"][0]["id"]; svc.files().update(fileId=fid,media_body=media,supportsAllDrives=True).execute()
         print("[Drive] 업데이트:",name); return fid
     meta={"name":name,"parents":[folder_id],"mimeType":"text/csv"}
-    fid=svc.files().create(body=meta,media_body=media,fields="id",supportsAllDrives=True,includeItemsFromAllDrives=True).execute()["id"]
+    fid=svc.files().create(body=meta,media_body=media,fields="id",supportsAllDrives=True).execute()["id"]
     print("[Drive] 업로드:",name); return fid
 
 def drive_download_csv(svc,folder_id,pattern_name):
