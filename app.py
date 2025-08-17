@@ -31,20 +31,21 @@ KST = pytz.timezone("Asia/Seoul")
 MOBILE_URLS = [
     "https://www.qoo10.jp/gmkt.inc/Mobile/Bestsellers/Default.aspx?group_code=2",
     "https://www.qoo10.jp/gmkt.inc/Mobile/Bestsellers/Default.aspx?__ar=Y&group_code=2",
+    "https://www.qoo10.jp/gmkt.inc/mobile/bestsellers/default.aspx?group_code=2",
 ]
 DESKTOP_URL = "https://www.qoo10.jp/gmkt.inc/Bestsellers/?g=2"
 MAX_RANK = int(os.getenv("QOO10_MAX_RANK", "200"))
 MAX_FALLING = 5
 MAX_OUT = int(os.getenv("QOO10_MAX_OUT", "10"))
 
-# ---------- Time ----------
+# ---------- Time / Utils ----------
 def today_kst_str(): return dt.datetime.now(KST).strftime("%Y-%m-%d")
 def yesterday_kst_str(): return (dt.datetime.now(KST) - dt.timedelta(days=1)).strftime("%Y-%m-%d")
 def build_filename(d): return f"큐텐재팬_뷰티_랭킹_{d}.csv"
 def clean_text(s): return re.sub(r"\s+", " ", (s or "")).strip()
 def slack_escape(s): return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
-# ---------- 이름/괄호 ----------
+# ---------- 이름/괄호 (슬랙 표시 전용) ----------
 BRACKETS_PAT = re.compile(r"(\[.*?\]|【.*?】|（.*?）|\(.*?\))")
 def strip_brackets_for_slack(s: str) -> str:
     return clean_text(BRACKETS_PAT.sub("", s or ""))
@@ -78,56 +79,113 @@ class Product:
 # ---------- Parse ----------
 def extract_goods_code(url: str, block_text=""):
     if not url: return ""
-    m = re.search(r"(?:[?&](?:goods?_?code|goodsno)=(\d+))", url)
+    m = re.search(r"(?:[?&](?:goods?_?code|goodsno)=(\d+))", url, re.I)
     if m: return m.group(1)
-    m2 = re.search(r"/(?:Item|item)/(?:.*?/)?(\d+)(?:[/?#]|$)", url)
+    m2 = re.search(r"/(?:Item|item|goods)/(?:.*?/)?(\d+)(?:[/?#]|$)", url)
     if m2: return m2.group(1)
     m3 = re.search(r"商品番号\s*[:：]\s*(\d+)", block_text or "")
     return m3.group(1) if m3 else ""
 
 def parse_mobile_html(html: str) -> List[Product]:
     soup = BeautifulSoup(html, "lxml")
-    anchors = soup.select("a[href*='Goods.aspx'],a[href*='/Item/']")
+    # 모바일/데스크톱 공통 패턴 모두 커버
+    anchors = soup.select(
+        "a[href*='Goods.aspx'], a[href*='/Item/'], a[href*='/item/'], a[href*='/goods']"
+    )
     items: List[Product] = []; seen = set()
     for a in anchors:
         href = a.get("href",""); 
         if not href: continue
-        cont = a.find_parent("li") or a.find_parent("div")
-        block = clean_text(cont.get_text(" ", strip=True)) if cont else ""
+        container = a.find_parent("li") or a.find_parent("div")
+        block_text = clean_text(container.get_text(" ", strip=True)) if container else ""
         if href.startswith("//"): href = "https:" + href
         elif href.startswith("/"): href = "https://www.qoo10.jp" + href
-        code = extract_goods_code(href, block); key = code or href
+        code = extract_goods_code(href, block_text); key = code or href
         if key in seen: continue; seen.add(key)
         name = clean_text(a.get_text(" ", strip=True))
-        sale, _, pct = compute_prices(block)
+        sale, _, pct = compute_prices(block_text)
         items.append(Product(len(items)+1, "", name, sale, pct, href, code))
         if len(items) >= MAX_RANK: break
     return items
 
+# ---------- Fetch ----------
 def fetch_by_http_mobile()->List[Product]:
-    headers = {"User-Agent":"Mozilla/5.0", "Accept-Language":"ja,en;q=0.8,ko;q=0.7"}
+    headers = {
+        "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Accept-Language":"ja,en-US;q=0.9,en;q=0.8,ko;q=0.7",
+        "Cache-Control":"no-cache","Pragma":"no-cache",
+    }
     for url in MOBILE_URLS:
         try:
             r = requests.get(url, headers=headers, timeout=20); r.raise_for_status()
             items = parse_mobile_html(r.text)
-            if len(items) >= 10: return items
-        except: pass
+            if len(items) >= 10: 
+                print(f"[HTTP 모바일] {url} → {len(items)}개")
+                return items
+        except Exception as e:
+            print("[HTTP 모바일 실패]", url, e)
     return []
 
-def fetch_by_playwright()->List[Product]:
+def fetch_by_playwright() -> List[Product]:
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
-        br = p.chromium.launch(headless=True, args=["--no-sandbox"])
-        ctx = br.new_context(locale="ja-JP", timezone_id="Asia/Tokyo")
-        page = ctx.new_page(); page.goto(DESKTOP_URL, timeout=60_000)
-        try: page.wait_for_load_state("networkidle", timeout=20_000)
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox","--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
+        context = browser.new_context(
+            viewport={"width":1366,"height":900},
+            locale="ja-JP",
+            timezone_id="Asia/Tokyo",
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"),
+            extra_http_headers={"Accept-Language":"ja,en-US;q=0.9,en;q=0.8,ko;q=0.7"},
+        )
+        context.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+        page = context.new_page()
+        page.goto(DESKTOP_URL, wait_until="domcontentloaded", timeout=60_000)
+        try: page.wait_for_load_state("networkidle", timeout=25_000)
         except: pass
-        html = page.content(); ctx.close(); br.close()
-    return parse_mobile_html(html)
+        data = page.evaluate("""
+            () => {
+              const as = Array.from(document.querySelectorAll(
+                "a[href*='Goods.aspx'], a[href*='/Item/'], a[href*='/item/'], a[href*='/goods']"
+              ));
+              const rows = []; const seen = new Set();
+              for (const a of as) {
+                const href = a.getAttribute('href') || '';
+                const name = (a.textContent || '').replace(/\\s+/g,' ').trim();
+                const li = a.closest('li') || a.closest('div');
+                if (!href || !name || !li) continue;
+                const block = (li.innerText || '').replace(/\\s+/g,' ').trim();
+                const key = href + "|" + name;
+                if (seen.has(key)) continue; seen.add(key);
+                rows.push({href, name, block});
+              }
+              return rows.slice(0, 500);
+            }
+        """)
+        context.close(); browser.close()
+    items: List[Product] = []; seen=set()
+    for row in data:
+        href=row.get("href",""); name=clean_text(row.get("name","")); block_text=clean_text(row.get("block",""))
+        if href.startswith("//"): href="https:" + href
+        elif href.startswith("/"): href="https://www.qoo10.jp" + href
+        code = extract_goods_code(href, block_text); key = code or href
+        if key in seen: continue; seen.add(key)
+        sale, _, pct = compute_prices(block_text)
+        items.append(Product(len(items)+1,"",name,sale,pct,href,code))
+        if len(items) >= MAX_RANK: break
+    print(f"[Playwright] {len(items)}개")
+    return items
 
 def fetch_products():
     items = fetch_by_http_mobile()
     if len(items) >= 10: return items
+    print("[Playwright 폴백]")
     return fetch_by_playwright()
 
 # ---------- Slack ----------
@@ -172,7 +230,6 @@ def _norm_product_code(v)->str:
     except: pass
     return str(v).strip()
 
-import urllib.parse
 def _norm_url(u:str)->str:
     if not u: return ""
     u = u.strip()
@@ -202,7 +259,7 @@ def build_sections(df_today:pd.DataFrame, df_prev:Optional[pd.DataFrame])->Dict[
     def link_name(r): return f"<{r['url']}|{slack_escape(plain_name(r))}>"
     prev_all = keyify(df_prev) if (df_prev is not None and len(df_prev)) else None
 
-    # TOP10
+    # TOP10 (변동 마커 + 번역)
     jp, lines = [], []
     for _, r in df_today.dropna(subset=["rank"]).sort_values("rank").head(10).iterrows():
         nm = plain_name(r); jp.append(nm); marker = ""
@@ -220,24 +277,25 @@ def build_sections(df_today:pd.DataFrame, df_prev:Optional[pd.DataFrame])->Dict[
 
     if prev_all is None: return S
 
-    # Falling
+    # 📉 급하락 (Top30 교집합, 하락폭>0, 정렬 후 상위 5개, 번역 포함)
     df_t = keyify(df_today); t30 = df_t[df_t["rank"]<=30]; p30 = prev_all[prev_all["rank"]<=30]
     common = set(t30.index)&set(p30.index); out = set(p30.index)-set(t30.index)
     pack=[]
     for k in common:
         pr, cr = int(p30.loc[k,"rank"]), int(t30.loc[k,"rank"]); drop = cr-pr
         if drop>0: pack.append((drop,cr,pr,t30.loc[k]))
-    pack.sort(key=lambda x:(-x[0],x[1],x[2]))
+    pack.sort(key=lambda x:(-x[0],x[1],x[2], clean_text(str(x[3].get('product_name','')))))
     fall_lines, jp2 = [], []
     for d,cr,pr,row in pack[:MAX_FALLING]:
         fall_lines.append(f"- {link_name(row)} {pr}위 → {cr}위 (↓{d})"); jp2.append(plain_name(row))
     kos2 = translate_ja_to_ko_batch(jp2)
     S["falling"] = [f"{a}\n{b}" if b else a for a,b in zip(fall_lines,kos2)]
 
-    # OUT
+    # OUT (번역 없음)
     outs = [(int(p30.loc[k,"rank"]), f"- {link_name(p30.loc[k])} {int(p30.loc[k,'rank'])}위 → OUT") for k in out]
     outs.sort(key=lambda x:x[0]); S["outs"] = [x[1] for x in outs[:MAX_OUT]]
 
+    # 인&아웃 개수
     S["inout_count"] = len(set(t30.index)-set(p30.index)) + len(out)
     return S
 
@@ -310,7 +368,7 @@ def drive_download_csv(svc,folder_id,pattern_name):
     fid=files[0]["id"]; req=svc.files().get_media(fileId=fid,supportsAllDrives=True)
     fh=io.BytesIO(); dl=MediaIoBaseDownload(fh,req); done=False
     while not done: _,done=dl.next_chunk()
-    fh.seek(0); print("[Drive] 다운로드:", files[0]["name"]); 
+    fh.seek(0); print("[Drive] 다운로드:", files[0]["name"])
     return pd.read_csv(fh)
 
 # ---------- Main ----------
