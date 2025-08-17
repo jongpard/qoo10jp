@@ -43,7 +43,6 @@ def slack_escape(s): return (s or "").replace("&","&amp;").replace("<","&lt;").r
 
 # ---------- 이름/괄호/노이즈 (슬랙 표시 전용) ----------
 BRACKETS_PAT = re.compile(r"(\[.*?\]|【.*?】|（.*?）|\(.*?\))")
-# 툴팁/쿠폰/단위/광고성 토큰 제거
 NOISE_TOKENS_RE = re.compile(
     r"(TooltipBtn|クーポン発行|クーポン|ショップ券|送料無料|即日|OFF|％|%|レビュー|ポイント|GIFT付|公式|セット|選べる|個|本|枚|ml|g)\s*",
     re.I,
@@ -55,12 +54,10 @@ def strip_brackets_for_slack(s: str) -> str:
     return clean_text(NOISE_TOKENS_RE.sub(" ", s))
 
 def score_title(s: str) -> int:
-    """일본어(가나/한자) 글자수를 가중치로 스코어링"""
     if not s: return -1
     low = s.lower()
-    # 브랜드/쇼핑몰명 같은 잡텍스트 필터
-    bads = ("wish", "qoo10", "shop", "ショップ", "公式", "ストア", "store")
-    if any(b in low for b in bads): return -1
+    if any(b in low for b in ("wish","shop","ショップ","store","公式","qoo10","ストア")):
+        return -1
     s = strip_brackets_for_slack(s)
     j = len(JP_CHAR_RE.findall(s))
     return j * 3 + len(s)
@@ -107,29 +104,18 @@ def normalize_href(href: str) -> str:
     return href
 
 def choose_product_title(li: BeautifulSoup, a: BeautifulSoup) -> str:
-    """a 텍스트가 'Wish' 등일 때, li 내부에서 가장 그럴듯한 제품명 선택"""
     cands = []
-
-    # 1) anchor title/텍스트
     tit = a.get("title")
     if tit: cands.append(tit)
     cands.append(a.get_text(" ", strip=True))
-
-    # 2) 대표 이미지 alt
     for img in li.select("img[alt]"):
         cands.append(img.get("alt", ""))
-
-    # 3) 자주 쓰이는 타이틀 요소
     for sel in [".tit", ".title", ".name", ".prd_tit", ".prd_name", ".tb-tit", ".goods_name"]:
         for el in li.select(sel):
             cands.append(el.get_text(" ", strip=True))
-
-    # 4) 블록 텍스트에서 후보 분리
     block = clean_text(li.get_text(" ", strip=True))
     for seg in re.split(r"[|•/▶▷›»·・\-–—]+", block):
         cands.append(seg)
-
-    # 스코어링
     best, best_sc = "", -1
     for s in cands:
         s = clean_text(s)
@@ -138,9 +124,18 @@ def choose_product_title(li: BeautifulSoup, a: BeautifulSoup) -> str:
             best_sc, best = sc, s
     return best or clean_text(a.get_text(" ", strip=True))
 
+# --- NEW: 광고/노이즈 li 필터 ---
+def is_ad_or_noise(name: str, url: str, code: str) -> bool:
+    if not name: return True
+    low = name.lower()
+    if any(b in low for b in ["wish","shop","ショップ","store","公式","qoo10","ストア","楽天","amazon"]):
+        return True
+    if not code and re.search(r"/(ad|adclick|event|shop)/", url.lower()):
+        return True
+    return False
+
 # ---------- Parse (랭킹 컨테이너 고정) ----------
 def _find_ranking_list(soup: BeautifulSoup):
-    """'Goods.aspx'류 링크가 10개 이상 포함된 UL/OL 중 가장 큰 블록을 랭킹으로 간주"""
     candidates = []
     for ul in soup.select("ul,ol"):
         cnt = len(ul.select("a[href*='Goods.aspx'], a[href*='/Item/'], a[href*='/item/'], a[href*='/goods']"))
@@ -163,13 +158,13 @@ def parse_mobile_html(html: str) -> List[Product]:
         href = normalize_href(a.get("href",""))
         block = clean_text(li.get_text(" ", strip=True))
         code = extract_goods_code(href, block)
+        name = choose_product_title(li, a)
+        if is_ad_or_noise(name, href, code):  # ★ 광고/노이즈 필터
+            continue
         key = code or href
         if key in seen: continue
         seen.add(key)
-
-        name = choose_product_title(li, a)  # ← 핵심
         sale, _, pct = compute_prices(block)
-
         items.append(Product(len(items)+1, "", name, sale, pct, href, code))
         if len(items) >= MAX_RANK: break
     return items
@@ -252,23 +247,20 @@ def fetch_by_playwright() -> List[Product]:
         href = normalize_href(row.get("href",""))
         block = clean_text(row.get("block",""))
         name_raw = clean_text(row.get("name",""))
-
-        # BeautifulSoup 없이도 이름 보정 필요 → 간단 필터
         name = strip_brackets_for_slack(name_raw)
+        code = extract_goods_code(href, block)
         if score_title(name) < 0:
-            # name 이 'Wish' 같은 경우, block에서 재선택
             segs = re.split(r"[|•/▶▷›»·・\-–—]+", block)
             best, best_sc = "", -1
             for s in segs:
                 sc = score_title(s)
                 if sc > best_sc: best_sc, best = sc, clean_text(s)
-            name = best or name_raw
-
-        code = extract_goods_code(href, block)
+            if best: name = best
+        if is_ad_or_noise(name, href, code):  # ★ 광고/노이즈 필터
+            continue
         key = code or href
         if key in seen: continue
         seen.add(key)
-
         sale, _, pct = compute_prices(block)
         items.append(Product(len(items)+1,"",name,sale,pct,href,code))
         if len(items) >= MAX_RANK: break
@@ -352,7 +344,7 @@ def build_sections(df_today:pd.DataFrame, df_prev:Optional[pd.DataFrame])->Dict[
     def link_name(r): return f"<{r['url']}|{slack_escape(plain_name(r))}>"
     prev_all = keyify(df_prev) if (df_prev is not None and len(df_prev)) else None
 
-    # TOP10 (변동 마커 + 번역)
+    # TOP10
     jp, lines = [], []
     for _, r in df_today.dropna(subset=["rank"]).sort_values("rank").head(10).iterrows():
         nm = plain_name(r); jp.append(nm); marker = ""
@@ -440,7 +432,6 @@ def drive_upload_csv(svc,folder_id,name,df):
     from googleapiclient.http import MediaIoBaseUpload
     buf=io.BytesIO(); df.to_csv(buf,index=False,encoding="utf-8-sig"); buf.seek(0)
     media=MediaIoBaseUpload(buf,mimetype="text/csv",resumable=False)
-    # create/update에는 includeItemsFromAllDrives 미사용
     q=f"name='{name}' and '{folder_id}' in parents and trashed=false"
     res=svc.files().list(q=q,fields="files(id)",supportsAllDrives=True).execute()
     if res.get("files"):
