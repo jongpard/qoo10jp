@@ -1,13 +1,27 @@
 # -*- coding: utf-8 -*-
+"""
+Qoo10 JP Beauty Bestsellers (g=2)
+- 모바일 정적 HTML 우선, 부족 시 Playwright 폴백
+- CSV: 큐텐재팬_뷰티_랭킹_YYYY-MM-DD.csv (KST)
+- 비교 키: product_code 우선, 없으면 URL(정규화)
+
+추가: 디버그 스냅샷 저장 (data/debug/)
+  - qoo10_mobile_*.html
+  - qoo10_desktop_*.html
+  - qoo10_desktop_li_###.html (상위 20개 li)
+  - extract_log.csv (추출 로그)
+"""
+
 import os, re, io, math, pytz, traceback, urllib.parse, base64, json
 import datetime as dt
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional, Tuple
 
 import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 
+# -------------------- Config --------------------
 KST = pytz.timezone("Asia/Seoul")
 MOBILE_URLS = [
     "https://www.qoo10.jp/gmkt.inc/Mobile/Bestsellers/Default.aspx?group_code=2",
@@ -17,8 +31,24 @@ MOBILE_URLS = [
 DESKTOP_URL = "https://www.qoo10.jp/gmkt.inc/Bestsellers/?g=2"
 MAX_RANK = int(os.getenv("QOO10_MAX_RANK", "200"))
 MAX_FALLING = 5
-MAX_OUT = int(os.getenv("QOO10_MAX_OUT", "50"))
+MAX_OUT = 50
 
+DEBUG_DIR = os.path.join("data", "debug")
+os.makedirs(DEBUG_DIR, exist_ok=True)
+
+def now_tag():
+    return dt.datetime.now(KST).strftime("%Y%m%d_%H%M%S")
+
+def save_text(path, text):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text or "")
+
+def snapshot(name: str, text: str):
+    path = os.path.join(DEBUG_DIR, f"{name}_{now_tag()}.html")
+    save_text(path, text)
+    print("[DEBUG] saved:", path)
+
+# -------------------- Utils --------------------
 def today_kst_str(): return dt.datetime.now(KST).strftime("%Y-%m-%d")
 def yesterday_kst_str(): return (dt.datetime.now(KST) - dt.timedelta(days=1)).strftime("%Y-%m-%d")
 def build_filename(d): return f"큐텐재팬_뷰티_랭킹_{d}.csv"
@@ -63,12 +93,14 @@ def compute_prices(block_text: str) -> Tuple[Optional[int], Optional[int], Optio
         pct = max(0, int(math.floor((1 - sale / orig) * 100)))
     return sale, orig, pct
 
+# -------------------- Models --------------------
 @dataclass
 class Product:
     rank: Optional[int]; brand: str; title: str
     price: Optional[int]; discount_percent: Optional[int]
     url: str; product_code: str = ""
 
+# -------------------- Helpers --------------------
 def extract_goods_code(url: str, block_text=""):
     if not url: return ""
     m = re.search(r"(?:[?&](?:goods?_?code|goodsno)=(\d+))", url, re.I)
@@ -83,42 +115,37 @@ def normalize_href(href: str) -> str:
     if href.startswith("/"):  return "https://www.qoo10.jp" + href
     return href
 
-# -------- 브랜드 추출(상점명) 확정판 --------
-def extract_brand_from_li(li: BeautifulSoup, title: str) -> str:
-    # 1) '公式' 배지 다음 링크 텍스트
-    for badge in li.find_all(string=re.compile(r"^\s*公式\s*$")):
-        # 배지의 다음 a
-        for sib in badge.parent.find_all_next(["a","span"], limit=5):
-            if sib.name == "a":
-                t = clean_text(sib.get_text(" ", strip=True))
-                if t and _brand_ok(t): return t
-            # 다른 텍스트 건너뛰기
-            if sib.name == "span" and clean_text(sib.get_text()) and "公式" not in sib.get_text():
-                # 다음 루프에서 계속 탐색
-                continue
-
-    # 2) 상점 링크 a[href*='/shop/'] 또는 seller/shop 클래스
-    for a in li.select("a[href*='/shop/'], a[href*='Shop'], a[class*='shop'], a[class*='seller'], a[class*='store']"):
-        t = clean_text(a.get_text(" ", strip=True))
-        if t and _brand_ok(t): return t
-
-    # 3) 상점명 영역
-    for sel in [".seller", ".shop", ".store", ".brand", ".brand-name", ".brandName", ".name__brand", ".goods_brand", ".prd_brand"]:
-        for el in li.select(sel):
-            t = clean_text(el.get_text(" ", strip=True))
-            if t and _brand_ok(t): return t
-
-    # 4) 제목 선두 토큰 추정
-    t0 = clean_text(title or "")
-    for m in (ROMAN_HEAD_RE.match(t0), KATAKANA_HEAD_RE.match(t0)):
-        if m and _brand_ok(m.group(1)): return m.group(1)
-    return ""
-
 def _brand_ok(b: str) -> bool:
     low = b.lower()
     if any(x in low for x in ["wish","shop","ショップ","store","公式","qoo10","ストア","楽天","amazon"]): return False
     if any(tok in b for tok in ["%","OFF","円"]): return False
     return True
+
+# ---- 브랜드: 상점명 우선(‘公式’ 뱃지 옆/상점 링크) ----
+def extract_brand_from_li(li: BeautifulSoup, title: str) -> str:
+    # 1) '公式' 텍스트가 있는 엘리먼트 근처의 a
+    for badge in li.find_all(string=re.compile(r"^\s*公式\s*$")):
+        for sib in badge.parent.find_all_next(["a","span"], limit=6):
+            if sib.name == "a":
+                t = clean_text(sib.get_text(" ", strip=True))
+                if t and _brand_ok(t): return t
+
+    # 2) 상점 링크 또는 seller/shop 클래스
+    for a in li.select("a[href*='/shop/'], a[href*='Shop'], a[class*='shop'], a[class*='seller'], a[class*='store']"):
+        t = clean_text(a.get_text(" ", strip=True))
+        if t and _brand_ok(t): return t
+
+    # 3) 영역 클래스
+    for sel in [".seller", ".shop", ".store", ".brand", ".brand-name", ".brandName", ".name__brand", ".goods_brand", ".prd_brand"]:
+        for el in li.select(sel):
+            t = clean_text(el.get_text(" ", strip=True))
+            if t and _brand_ok(t): return t
+
+    # 4) 제목 선두 토큰
+    t0 = clean_text(title or "")
+    for m in (ROMAN_HEAD_RE.match(t0), KATAKANA_HEAD_RE.match(t0)):
+        if m and _brand_ok(m.group(1)): return m.group(1)
+    return ""
 
 def choose_product_title(li: BeautifulSoup, a: BeautifulSoup) -> str:
     cands = []
@@ -143,6 +170,7 @@ def is_ad_or_noise(name: str, url: str, code: str) -> bool:
     if not code and re.search(r"/(ad|adclick|event|shop)/", url.lower()): return True
     return False
 
+# -------------------- Parse --------------------
 def _find_ranking_list(soup: BeautifulSoup):
     candidates = []
     for ul in soup.select("ul,ol"):
@@ -156,7 +184,9 @@ def parse_mobile_html(html: str) -> List[Product]:
     soup = BeautifulSoup(html, "lxml")
     root = _find_ranking_list(soup) or soup
     items: List[Product] = []; seen=set()
+
     lis = root.select(":scope > li") or root.select("li")
+    extract_rows = []
     for li in lis:
         a = li.select_one("a[href*='Goods.aspx'], a[href*='/Item/'], a[href*='/item/'], a[href*='/goods']")
         if not a: continue
@@ -166,14 +196,29 @@ def parse_mobile_html(html: str) -> List[Product]:
         name = choose_product_title(li, a)
         if is_ad_or_noise(name, href, code): continue
         brand = extract_brand_from_li(li, name)
+
         key = code or href
         if key in seen: continue
         seen.add(key)
         sale, _, pct = compute_prices(block)
-        items.append(Product(len(items)+1, brand, name, sale, pct, href, code))
+        prod = Product(len(items)+1, brand, name, sale, pct, href, code)
+        items.append(prod)
+
+        # 로그
+        extract_rows.append({
+            "rank": prod.rank, "brand": brand, "title": name, "url": href,
+            "product_code": code, "price": sale, "pct": pct, "src": "mobile"
+        })
         if len(items) >= MAX_RANK: break
+
+    # 저장
+    if extract_rows:
+        df = pd.DataFrame(extract_rows)
+        df.to_csv(os.path.join(DEBUG_DIR, "extract_log.csv"), index=False, encoding="utf-8-sig")
+
     return items
 
+# -------------------- Fetch --------------------
 def fetch_by_http_mobile()->List[Product]:
     headers = {
         "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36",
@@ -183,6 +228,7 @@ def fetch_by_http_mobile()->List[Product]:
     for url in MOBILE_URLS:
         try:
             r = requests.get(url, headers=headers, timeout=20); r.raise_for_status()
+            snapshot("qoo10_mobile", r.text)  # ★ 모바일 HTML 스냅샷
             items = parse_mobile_html(r.text)
             if len(items) >= 10:
                 print(f"[HTTP 모바일] {url} → {len(items)}개")
@@ -197,17 +243,23 @@ def fetch_by_playwright() -> List[Product]:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage","--disable-blink-features=AutomationControlled"])
         context = browser.new_context(
             viewport={"width":1366,"height":900}, locale="ja-JP", timezone_id="Asia/Tokyo",
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"),
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"),
             extra_http_headers={"Accept-Language":"ja,en-US;q=0.9,en;q=0.8,ko;q=0.7"},
         )
         context.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
-        page = context.new_page(); page.goto(DESKTOP_URL, wait_until="domcontentloaded", timeout=60_000)
+        page = context.new_page()
+        page.goto(DESKTOP_URL, wait_until="domcontentloaded", timeout=60_000)
         try: page.wait_for_load_state("networkidle", timeout=25_000)
         except: pass
-        rows = page.evaluate("""
+
+        # 전체 HTML 스냅샷
+        html = page.content()
+        snapshot("qoo10_desktop", html)
+
+        # li 20개 outerHTML 저장
+        li_htmls = page.evaluate("""
             () => {
-              function findRankingList() {
+              function findRoot() {
                 const lists = Array.from(document.querySelectorAll('ul,ol'));
                 let best=null, bestCnt=0;
                 for (const el of lists) {
@@ -216,7 +268,27 @@ def fetch_by_playwright() -> List[Product]:
                 }
                 return best || document;
               }
-              const root = findRankingList();
+              const root = findRoot();
+              const lis = (root.querySelectorAll(':scope > li').length ? root.querySelectorAll(':scope > li') : root.querySelectorAll('li'));
+              return Array.from(lis).slice(0, 20).map(li => li.outerHTML);
+            }
+        """)
+        for i, outer in enumerate(li_htmls, start=1):
+            save_text(os.path.join(DEBUG_DIR, f"qoo10_desktop_li_{i:03}.html"), outer)
+
+        # 파싱용 최소 데이터
+        rows = page.evaluate("""
+            () => {
+              function findRoot() {
+                const lists = Array.from(document.querySelectorAll('ul,ol'));
+                let best=null, bestCnt=0;
+                for (const el of lists) {
+                  const cnt = el.querySelectorAll("a[href*='Goods.aspx'], a[href*='/Item/'], a[href*='/item/'], a[href*='/goods']").length;
+                  if (cnt >= 10 && cnt > bestCnt) { best = el; bestCnt = cnt; }
+                }
+                return best || document;
+              }
+              const root = findRoot();
               const list = root.querySelectorAll(':scope > li').length ? root.querySelectorAll(':scope > li') : root.querySelectorAll('li');
               const out = []; const seen = new Set(); let rank = 1;
               for (const li of list) {
@@ -225,11 +297,9 @@ def fetch_by_playwright() -> List[Product]:
                 const href = a.getAttribute('href') || '';
                 const name = (a.textContent || '').replace(/\\s+/g,' ').trim();
                 const block = (li.innerText || '').replace(/\\s+/g,' ').trim();
-                const brandEl = li.querySelector("span,div,em,b,strong"); // for badge area
-                const html = li.innerHTML;
                 const key = href + '|' + name;
                 if (seen.has(key)) continue; seen.add(key);
-                out.push({href, name, block, html});
+                out.push({href, name, block, html: li.outerHTML, rank: rank++});
                 if (out.length >= 500) break;
               }
               return out;
@@ -237,7 +307,8 @@ def fetch_by_playwright() -> List[Product]:
         """)
         context.close(); browser.close()
 
-    items: List[Product] = []; seen=set()
+    # soup로 다시 브랜드 시도 + 로그
+    items: List[Product] = []; seen=set(); logs=[]
     for row in rows:
         href = normalize_href(row.get("href",""))
         block = clean_text(row.get("block",""))
@@ -246,7 +317,6 @@ def fetch_by_playwright() -> List[Product]:
         code = extract_goods_code(href, block)
 
         brand = ""
-        # HTML에서 '公式' 다음 링크 텍스트 추출
         try:
             sub = BeautifulSoup(row.get("html",""), "lxml")
             brand = extract_brand_from_li(sub, name)
@@ -263,7 +333,7 @@ def fetch_by_playwright() -> List[Product]:
             for s in segs:
                 sc = score_title(s)
                 if sc > best_sc: best_sc, best = sc, clean_text(s)
-            if best: 
+            if best:
                 name = best
                 if not brand:
                     for rgx in (ROMAN_HEAD_RE, KATAKANA_HEAD_RE):
@@ -275,8 +345,21 @@ def fetch_by_playwright() -> List[Product]:
         if key in seen: continue
         seen.add(key)
         sale, _, pct = compute_prices(block)
-        items.append(Product(len(items)+1, brand, name, sale, pct, href, code))
+        prod = Product(len(items)+1, brand, name, sale, pct, href, code)
+        items.append(prod)
+        logs.append({**asdict(prod), "src":"desktop"})
+
         if len(items) >= MAX_RANK: break
+
+    if logs:
+        df = pd.DataFrame(logs)
+        # append or write
+        p = os.path.join(DEBUG_DIR, "extract_log.csv")
+        if os.path.exists(p):
+            old = pd.read_csv(p)
+            df = pd.concat([old, df], ignore_index=True)
+        df.to_csv(p, index=False, encoding="utf-8-sig")
+
     print(f"[Playwright] {len(items)}개")
     return items
 
@@ -285,6 +368,7 @@ def fetch_products():
     if len(items) >= 10: return items
     print("[Playwright 폴백]"); return fetch_by_playwright()
 
+# -------------------- Slack --------------------
 def fmt_currency(v):
     try: return f"₩{int(v):,}"
     except: return "₩0"
@@ -295,6 +379,7 @@ def slack_post(text):
     try: requests.post(url, json={"text": text, "unfurl_links": False, "unfurl_media": False}, timeout=20)
     except Exception as e: print("[Slack 전송 실패]", e); print(text)
 
+# -------------------- Translate --------------------
 def translate_ja_to_ko_batch(lines: List[str])->List[str]:
     if not (os.getenv("SLACK_TRANSLATE_JA2KO","0").lower() in ("1","true","yes")): return ["" for _ in lines]
     try:
@@ -308,12 +393,14 @@ def translate_ja_to_ko_batch(lines: List[str])->List[str]:
             gt = DT(source='ja', target='ko'); return [gt.translate(t) if t else "" for t in lines]
         except Exception: return [""]*len(lines)
 
+# -------------------- DataFrame --------------------
 def to_dataframe(products: List[Product], date_str: str)->pd.DataFrame:
     return pd.DataFrame([{
         "date": date_str, "rank": p.rank, "brand": p.brand, "product_name": p.title,
         "price": p.price, "discount_percent": p.discount_percent, "url": p.url, "product_code": p.product_code
     } for p in products])
 
+# -------------------- Key normalize --------------------
 def _norm_product_code(v)->str:
     if pd.isna(v): return ""
     try:
@@ -344,14 +431,19 @@ def keyify(df):
     df.set_index("key", inplace=True)
     return df
 
+# -------------------- Sections --------------------
 def build_sections(df_today:pd.DataFrame, df_prev:Optional[pd.DataFrame])->Dict[str,List[str]]:
     S={"top10":[], "falling":[], "outs":[], "inout_count":0}
+
     def plain_name(r):
         nm = strip_brackets_for_slack(clean_text(r.get("product_name","")))
         br = clean_text(r.get("brand",""))
-        if br and not nm.lower().startswith(br.lower()): nm = f"{br} {nm}"
+        if br and not nm.lower().startswith(br.lower()):
+            nm = f"{br} {nm}"
         return nm
+
     def full_link(r): return f"<{r['url']}|{slack_escape(plain_name(r))}>"
+
     def interleave_ko(lines: List[str], jp_texts: List[str]) -> List[str]:
         kos = translate_ja_to_ko_batch(jp_texts); out=[]
         for i,ln in enumerate(lines):
@@ -372,10 +464,12 @@ def build_sections(df_today:pd.DataFrame, df_prev:Optional[pd.DataFrame])->Dict[
         tail = f" (↓{int(r['discount_percent'])}%)" if pd.notnull(r["discount_percent"]) else ""
         lines.append(f"{int(r['rank'])}. {marker}{full_link(r)} — {fmt_currency(r['price'])}{tail}")
     S["top10"] = interleave_ko(lines, jp)
+
     if prev_all is None: return S
 
     df_t = keyify(df_today); t30 = df_t[df_t["rank"]<=30]; p30 = prev_all[prev_all["rank"]<=30]
     common = set(t30.index)&set(p30.index); out = set(p30.index)-set(t30.index)
+
     movers=[]
     for k in common:
         pr, cr = int(p30.loc[k,"rank"]), int(t30.loc[k,"rank"])
@@ -399,12 +493,14 @@ def build_sections(df_today:pd.DataFrame, df_prev:Optional[pd.DataFrame])->Dict[
     S["inout_count"] = len(set(t30.index)-set(p30.index)) + len(out)
     return S
 
+# -------------------- Slack message --------------------
 def build_slack_message(date,S):
     lines=[f"*🛒 큐텐 재팬 뷰티 랭킹 — {date}*","","*TOP 10*"]
     lines+=S["top10"]; lines+=["","*📉 급하락*"]; lines+=S["falling"] or ["- 해당 없음"]
     lines+=["","*🔄 랭크 인&아웃*", f"{S['inout_count']}개의 제품이 인&아웃 되었습니다."]
     return "\n".join(lines)
 
+# -------------------- Google Drive --------------------
 def _drive_service_service_account():
     try:
         from googleapiclient.discovery import build
@@ -463,6 +559,7 @@ def drive_download_csv(svc,folder_id,pattern_name):
     fh.seek(0); print("[Drive] 다운로드:", files[0]["name"])
     return pd.read_csv(fh)
 
+# -------------------- Main --------------------
 def main():
     date=today_kst_str(); today_file=build_filename(date); yest_file=build_filename(yesterday_kst_str())
     print("[INFO] 수집 시작")
@@ -470,6 +567,7 @@ def main():
     if len(items)<10:
         print("[Playwright 폴백]"); items=fetch_by_playwright()
     if len(items)<10: raise RuntimeError("제품 카드 수가 너무 적습니다.")
+
     df_today=to_dataframe(items,date)
     os.makedirs("data",exist_ok=True)
     df_today.to_csv(os.path.join("data",today_file),index=False,encoding="utf-8-sig")
