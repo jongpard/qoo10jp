@@ -20,31 +20,39 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install playwright==1.46.0
-          pip install beautifulsoup4 lxml requests
-          pip install google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2
+    # --- Install steps (지금 그대로 사용해도 됨)
+- name: Install dependencies
+  run: |
+    python -m pip install --upgrade pip
+    pip install playwright==1.46.0
+    pip install beautifulsoup4 lxml requests
+    pip install google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2
 
-      - name: Install Playwright browsers
-        run: |
-          python -m playwright install --with-deps chromium
+- name: Install Playwright browsers
+  run: |
+    python -m playwright install --with-deps chromium
 
-      - name: Run python app.py
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
-          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
-          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
-          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-        run: |
-          python app.py
+# --- Run
+- name: Run python app.py
+  env:
+    PYTHONIOENCODING: utf-8
+    TZ: Asia/Seoul
+    # 필요한 경우에만 1로 설정해 항상 브라우저 수집 (HTTP가 0건 나오는 환경이면 추천)
+    FORCE_PLAYWRIGHT: "1"
+    SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+    GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+    GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+    GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+  run: |
+    python app.py
 
-      - name: Upload CSV artifact (optional)
-        uses: actions/upload-artifact@v4
-        with:
-          name: csv-${{ github.run_id }}
-          path: data/*.csv
-          if-no-files-found: warn
-          compression-level: 6
+# --- Upload CSV artifact (optional)
+- name: Upload artifacts (optional)
+  uses: actions/upload-artifact@v4
+  with:
+    name: csv-${{ github.run_id }}
+    path: data/*.csv
+    if-no-files-found: warn
+    compression-level: 6
+
