@@ -423,7 +423,7 @@ def build_sections(df_today:pd.DataFrame, df_prev:Optional[pd.DataFrame])->Dict[
 
 # -------------------- Slack message --------------------
 def build_slack_message(date,S):
-    lines=[f"*🛒 큐텐 재팬 뷰티 랭킹 — {date}*","","*TOP 10*"]
+    lines=[f"*🛒 큐텐 재팬 뷰티 랭킹 200 — {date}*","","*TOP 10*"]
     lines+=S["top10"]; lines+=["","*📉 급하락*"]; lines+=S["falling"] or ["- 해당 없음"]
     lines+=["","*🔄 랭크 인&아웃*", f"{S['inout_count']}개의 제품이 인&아웃 되었습니다."]
     return "\n".join(lines)
