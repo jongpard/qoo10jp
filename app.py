@@ -426,18 +426,26 @@ def to_dataframe(products: List[Product], date_str: str) -> pd.DataFrame:
     } for p in products])
 
 def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> Dict[str, List[str]]:
-    S = {"top10": [], "rising": [], "newcomers": [], "falling": [], "outs": [], "inout_count": 0}
+    """
+    슬랙 메시지 전용 섹션 빌드
+    - TOP10: (↑n)/(↓n)/(New) 마커, 각 항목 아래 번역 1줄(옵션)
+    - 급상승/뉴랭커: 제거
+    - 급하락: 전일·당일 Top30 교집합 중 하락 + OUT 포함해 최대 5개, 각 항목 아래 번역 1줄(옵션)
+    - 인&아웃: 개수만
+    """
+    S = {"top10": [], "falling": [], "inout_count": 0}
 
-    # 공통: 브랜드+이름(괄호 제거) 원문 생성
-    def plain_name(row):
-        nm = strip_brackets_for_slack(clean_text(row.get("product_name","")))
-        br = clean_text(row.get("brand",""))
+    def _plain_name(row):
+        nm = strip_brackets_for_slack(clean_text(row.get("product_name", "")))
+        br = clean_text(row.get("brand", ""))
         if br and not nm.lower().startswith(br.lower()):
             nm = f"{br} {nm}"
         return nm
 
-    # 공통: 번역 interleave
-    def interleave_with_ko(lines: List[str], jp_texts: List[str]) -> List[str]:
+    def _link(row):
+        return f"<{row['url']}|{slack_escape(_plain_name(row))}>"
+
+    def _interleave(lines, jp_texts):
         kos = translate_ja_to_ko_batch(jp_texts)
         out = []
         for i, ln in enumerate(lines):
@@ -446,19 +454,89 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
                 out.append(kos[i])
         return out
 
-    # ---- TOP 10
-    top10 = df_today.dropna(subset=["rank"]).sort_values("rank").head(10)
-    jp_for_tr, top10_lines = [], []
-    for _, r in top10.iterrows():
-        disp = plain_name(r)  # 괄호 제거+브랜드 결합
-        jp_for_tr.append(disp)  # 번역 문장(가격/할인 제외)
-        name_link = f"<{r['url']}|{slack_escape(disp)}>"
-        tail = f" (↓{int(r['discount_percent'])}%)" if pd.notnull(r.get("discount_percent")) else ""
-        top10_lines.append(f"{int(r['rank'])}. {name_link} — {fmt_currency_jpy(r['price'])}{tail}")
-    S["top10"] = interleave_with_ko(top10_lines, jp_for_tr)
+    # ---------- TOP 10 ----------
+    prev_index = None
+    if df_prev is not None and len(df_prev):
+        prev_index = df_prev.copy()
+        # product_code 우선, 없으면 url 키로 인덱스
+        prev_index["__key__"] = prev_index.apply(
+            lambda x: (str(x.get("product_code")).strip() if (pd.notnull(x.get("product_code")) and str(x.get("product_code")).strip()) else str(x.get("url")).strip()),
+            axis=1
+        )
+        prev_index.set_index("__key__", inplace=True)
 
-    if df_prev is None or not len(df_prev):
+    jp_rows, lines = [], []
+    top10 = df_today.dropna(subset=["rank"]).sort_values("rank").head(10)
+    for _, r in top10.iterrows():
+        jp_rows.append(_plain_name(r))
+        marker = ""
+        if prev_index is not None:
+            key = (str(r.get("product_code")).strip() if (pd.notnull(r.get("product_code")) and str(r.get("product_code")).strip()) else str(r.get("url")).strip())
+            if key in prev_index.index and pd.notnull(prev_index.loc[key, "rank"]):
+                pr, cr = int(prev_index.loc[key, "rank"]), int(r["rank"])
+                d = pr - cr
+                marker = f"(↑{d}) " if d > 0 else (f"(↓{abs(d)}) " if d < 0 else "")
+            else:
+                marker = "(New) "
+        tail = f" (↓{int(r['discount_percent'])}%)" if pd.notnull(r.get("discount_percent")) else ""
+        try:
+            price_str = f"₩{int(r.get('price')):,}"
+        except Exception:
+            price_str = "₩0"
+        lines.append(f"{int(r['rank'])}. {marker}{_link(r)} — {price_str}{tail}")
+    S["top10"] = _interleave(lines, jp_rows)
+
+    if prev_index is None:
         return S
+
+    # ---------- 급하락 (최대 5개, OUT 포함 보충) ----------
+    cur_index = df_today.copy()
+    cur_index["__key__"] = cur_index.apply(
+        lambda x: (str(x.get("product_code")).strip() if (pd.notnull(x.get("product_code")) and str(x.get("product_code")).strip()) else str(x.get("url")).strip()),
+        axis=1
+    )
+    cur_index.set_index("__key__", inplace=True)
+
+    t30 = cur_index[(cur_index["rank"].notna()) & (cur_index["rank"] <= 30)]
+    p30 = prev_index[(prev_index["rank"].notna()) & (prev_index["rank"] <= 30)]
+
+    common = set(t30.index) & set(p30.index)
+    out_keys = set(p30.index) - set(t30.index)
+
+    movers = []
+    for k in common:
+        pr, cr = int(p30.loc[k, "rank"]), int(t30.loc[k, "rank"])
+        drop = cr - pr
+        if drop > 0:
+            row = t30.loc[k]
+            movers.append((drop, cr, pr, f"- {_link(row)} {pr}위 → {cr}위 (↓{drop})", _plain_name(row)))
+
+    # 하락폭 내림차순 → 오늘 순위 → 전일 순위 → 제품명
+    movers.sort(key=lambda x: (-x[0], x[1], x[2], x[4]))
+
+    chosen_lines, chosen_jp = [], []
+    for _, _, _, txt, jpn in movers:
+        if len(chosen_lines) >= 5:
+            break
+        chosen_lines.append(txt)
+        chosen_jp.append(jpn)
+
+    # OUT 보충
+    if len(chosen_lines) < 5:
+        outs_sorted = sorted(list(out_keys), key=lambda k: int(p30.loc[k, "rank"]))
+        for k in outs_sorted:
+            if len(chosen_lines) >= 5:
+                break
+            row = p30.loc[k]
+            txt = f"- {_link(row)} {int(row['rank'])}위 → OUT"
+            chosen_lines.append(txt)
+            chosen_jp.append(_plain_name(row))
+
+    S["falling"] = _interleave(chosen_lines, chosen_jp)
+
+    # ---------- 인&아웃 개수 ----------
+    S["inout_count"] = len(set(t30.index) - set(p30.index)) + len(out_keys)
+    return S
 
     # ---- 비교용 키
     def keyify(df):
@@ -537,12 +615,13 @@ def build_slack_message(date_str: str, S: Dict[str, List[str]]) -> str:
     lines: List[str] = []
     lines.append(f"*큐텐 재팬 뷰티 랭킹 — {date_str}*")
     lines.append("")
-    lines.append("*TOP 10*");          lines.extend(S.get("top10") or ["- 데이터 없음"]); lines.append("")
-    lines.append("*🔥 급상승*");       lines.extend(S.get("rising") or ["- 해당 없음"]); lines.append("")
-    lines.append("*🆕 뉴랭커*");       lines.extend(S.get("newcomers") or ["- 해당 없음"]); lines.append("")
-    lines.append("*📉 급하락*");       lines.extend(S.get("falling") or ["- 해당 없음"])
-    lines.extend(S.get("outs") or [])
-    lines.append(""); lines.append("*🔄 랭크 인&아웃*")
+    lines.append("*TOP 10*")
+    lines.extend(S.get("top10") or ["- 데이터 없음"])
+    lines.append("")
+    lines.append("*📉 급하락*")
+    lines.extend(S.get("falling") or ["- 해당 없음"])
+    lines.append("")
+    lines.append("*🔄 랭크 인&아웃*")
     lines.append(f"{S.get('inout_count', 0)}개의 제품이 인&아웃 되었습니다.")
     return "\n".join(lines)
 
