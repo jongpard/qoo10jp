@@ -1,58 +1,62 @@
-name: qoo10jp_ranking
+name: run
 
 on:
   workflow_dispatch:
-  schedule:
-    # 매일 KST 09:10 (UTC 00:10) 실행 예시 - 원하시는 시간으로 조정하세요
-    - cron: "10 0 * * *"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    env:
+      TZ: Asia/Seoul
+      PYTHONIOENCODING: utf-8
+      # ↓ 필요한 비밀값들 (레포 Secrets에 이미 저장되어 있어야 합니다)
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+      GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+      GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+      GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+      # 선택: 일본어→한국어 번역 사용 시 1, 미사용 0
+      SLACK_TRANSLATE_JA2KO: ${{ secrets.SLACK_TRANSLATE_JA2KO }}
+      # HTTP 파싱이 0건일 때를 대비해 기본값으로 브라우저 수집 강제
+      FORCE_PLAYWRIGHT: "1"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: '3.10'
 
-    # --- Install steps (지금 그대로 사용해도 됨)
-- name: Install dependencies
-  run: |
-    python -m pip install --upgrade pip
-    pip install playwright==1.46.0
-    pip install beautifulsoup4 lxml requests
-    pip install google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright==1.46.0
+          pip install beautifulsoup4 lxml requests
+          pip install google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2
 
-- name: Install Playwright browsers
-  run: |
-    python -m playwright install --with-deps chromium
+      - name: Install Playwright browsers
+        run: |
+          python -m playwright install --with-deps chromium
 
-# --- Run
-- name: Run python app.py
-  env:
-    PYTHONIOENCODING: utf-8
-    TZ: Asia/Seoul
-    # 필요한 경우에만 1로 설정해 항상 브라우저 수집 (HTTP가 0건 나오는 환경이면 추천)
-    FORCE_PLAYWRIGHT: "1"
-    SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-    GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
-    GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
-    GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
-    GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-  run: |
-    python app.py
+      - name: Run python app.py
+        run: |
+          python app.py
 
-# --- Upload CSV artifact (optional)
-- name: Upload artifacts (optional)
-  uses: actions/upload-artifact@v4
-  with:
-    name: csv-${{ github.run_id }}
-    path: data/*.csv
-    if-no-files-found: warn
-    compression-level: 6
+      - name: Upload CSV artifact (optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: csv-${{ github.run_id }}
+          path: data/*.csv
+          if-no-files-found: warn
+          compression-level: 6
 
+      - name: Upload debug files (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-${{ github.run_id }}
+          path: data/debug/**
+          if-no-files-found: warn
+          compression-level: 6
