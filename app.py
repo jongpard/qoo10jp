@@ -1,15 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 Qoo10 JP Beauty Bestsellers (g=2)
+
 - 모바일 정적 HTML 우선, 부족 시 Playwright 폴백
 - CSV: 큐텐재팬_뷰티_랭킹_YYYY-MM-DD.csv (KST)
 - 비교 키: product_code 우선, 없으면 URL(정규화)
 
-추가: 디버그 스냅샷 저장 (data/debug/)
-  - qoo10_mobile_*.html
-  - qoo10_desktop_*.html
-  - qoo10_desktop_li_###.html (상위 20개 li)
-  - extract_log.csv (추출 로그)
+Slack 포맷:
+ TOP 10 (변동 마커 + 번역, '브랜드 제품명 — ₩가격 (↓할인%)')
+ 📉 급하락 (5개만, OUT 포함, 번역)
+ 🔄 랭크 인&아웃 (개수만)
+
+디버그 스냅샷:
+ data/debug/qoo10_mobile_*.html, qoo10_desktop_*.html, qoo10_desktop_li_###.html, extract_log.csv
 """
 
 import os, re, io, math, pytz, traceback, urllib.parse, base64, json
@@ -31,22 +34,14 @@ MOBILE_URLS = [
 DESKTOP_URL = "https://www.qoo10.jp/gmkt.inc/Bestsellers/?g=2"
 MAX_RANK = int(os.getenv("QOO10_MAX_RANK", "200"))
 MAX_FALLING = 5
-MAX_OUT = 50
-
 DEBUG_DIR = os.path.join("data", "debug")
 os.makedirs(DEBUG_DIR, exist_ok=True)
 
-def now_tag():
-    return dt.datetime.now(KST).strftime("%Y%m%d_%H%M%S")
-
-def save_text(path, text):
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text or "")
-
+def now_tag(): return dt.datetime.now(KST).strftime("%Y%m%d_%H%M%S")
+def save_text(path, text): open(path, "w", encoding="utf-8").write(text or "")
 def snapshot(name: str, text: str):
     path = os.path.join(DEBUG_DIR, f"{name}_{now_tag()}.html")
-    save_text(path, text)
-    print("[DEBUG] saved:", path)
+    save_text(path, text); print("[DEBUG] saved:", path)
 
 # -------------------- Utils --------------------
 def today_kst_str(): return dt.datetime.now(KST).strftime("%Y-%m-%d")
@@ -121,27 +116,35 @@ def _brand_ok(b: str) -> bool:
     if any(tok in b for tok in ["%","OFF","円"]): return False
     return True
 
-# ---- 브랜드: 상점명 우선(‘公式’ 뱃지 옆/상점 링크) ----
+# ---- 브랜드: 상점명 우선 ----
 def extract_brand_from_li(li: BeautifulSoup, title: str) -> str:
-    # 1) '公式' 텍스트가 있는 엘리먼트 근처의 a
+    # (모바일) <span class="mShop">公式 O&ME</span>
+    mshop = li.select_one(".mShop")
+    if mshop:
+        txt = clean_text(mshop.get_text(" ", strip=True)).replace("公式", "").strip()
+        if txt and _brand_ok(txt): return txt
+
+    # (배지) '公式' 텍스트 근처의 a
     for badge in li.find_all(string=re.compile(r"^\s*公式\s*$")):
-        for sib in badge.parent.find_all_next(["a","span"], limit=6):
+        par = badge.parent if badge and getattr(badge, "parent", None) else None
+        if not par: continue
+        for sib in par.find_all_next(["a","span"], limit=6):
             if sib.name == "a":
                 t = clean_text(sib.get_text(" ", strip=True))
                 if t and _brand_ok(t): return t
 
-    # 2) 상점 링크 또는 seller/shop 클래스
+    # (링크/클래스) 상점 링크
     for a in li.select("a[href*='/shop/'], a[href*='Shop'], a[class*='shop'], a[class*='seller'], a[class*='store']"):
         t = clean_text(a.get_text(" ", strip=True))
         if t and _brand_ok(t): return t
 
-    # 3) 영역 클래스
+    # (영역) 상점명 영역
     for sel in [".seller", ".shop", ".store", ".brand", ".brand-name", ".brandName", ".name__brand", ".goods_brand", ".prd_brand"]:
         for el in li.select(sel):
             t = clean_text(el.get_text(" ", strip=True))
             if t and _brand_ok(t): return t
 
-    # 4) 제목 선두 토큰
+    # (폴백) 제목 선두 토큰
     t0 = clean_text(title or "")
     for m in (ROMAN_HEAD_RE.match(t0), KATAKANA_HEAD_RE.match(t0)):
         if m and _brand_ok(m.group(1)): return m.group(1)
@@ -149,8 +152,7 @@ def extract_brand_from_li(li: BeautifulSoup, title: str) -> str:
 
 def choose_product_title(li: BeautifulSoup, a: BeautifulSoup) -> str:
     cands = []
-    tit = a.get("title")
-    if tit: cands.append(tit)
+    tit = a.get("title");  cands.append(tit or "")
     cands.append(a.get_text(" ", strip=True))
     for img in li.select("img[alt]"): cands.append(img.get("alt", ""))
     for sel in [".tit", ".title", ".name", ".prd_tit", ".prd_name", ".tb-tit", ".goods_name"]:
@@ -184,9 +186,9 @@ def parse_mobile_html(html: str) -> List[Product]:
     soup = BeautifulSoup(html, "lxml")
     root = _find_ranking_list(soup) or soup
     items: List[Product] = []; seen=set()
+    logs = []
 
     lis = root.select(":scope > li") or root.select("li")
-    extract_rows = []
     for li in lis:
         a = li.select_one("a[href*='Goods.aspx'], a[href*='/Item/'], a[href*='/item/'], a[href*='/goods']")
         if not a: continue
@@ -203,19 +205,11 @@ def parse_mobile_html(html: str) -> List[Product]:
         sale, _, pct = compute_prices(block)
         prod = Product(len(items)+1, brand, name, sale, pct, href, code)
         items.append(prod)
-
-        # 로그
-        extract_rows.append({
-            "rank": prod.rank, "brand": brand, "title": name, "url": href,
-            "product_code": code, "price": sale, "pct": pct, "src": "mobile"
-        })
+        logs.append({**asdict(prod), "src":"mobile"})
         if len(items) >= MAX_RANK: break
 
-    # 저장
-    if extract_rows:
-        df = pd.DataFrame(extract_rows)
-        df.to_csv(os.path.join(DEBUG_DIR, "extract_log.csv"), index=False, encoding="utf-8-sig")
-
+    if logs:
+        pd.DataFrame(logs).to_csv(os.path.join(DEBUG_DIR, "extract_log.csv"), index=False, encoding="utf-8-sig")
     return items
 
 # -------------------- Fetch --------------------
@@ -228,7 +222,7 @@ def fetch_by_http_mobile()->List[Product]:
     for url in MOBILE_URLS:
         try:
             r = requests.get(url, headers=headers, timeout=20); r.raise_for_status()
-            snapshot("qoo10_mobile", r.text)  # ★ 모바일 HTML 스냅샷
+            snapshot("qoo10_mobile", r.text)  # 모바일 HTML 저장
             items = parse_mobile_html(r.text)
             if len(items) >= 10:
                 print(f"[HTTP 모바일] {url} → {len(items)}개")
@@ -252,7 +246,6 @@ def fetch_by_playwright() -> List[Product]:
         try: page.wait_for_load_state("networkidle", timeout=25_000)
         except: pass
 
-        # 전체 HTML 스냅샷
         html = page.content()
         snapshot("qoo10_desktop", html)
 
@@ -276,7 +269,6 @@ def fetch_by_playwright() -> List[Product]:
         for i, outer in enumerate(li_htmls, start=1):
             save_text(os.path.join(DEBUG_DIR, f"qoo10_desktop_li_{i:03}.html"), outer)
 
-        # 파싱용 최소 데이터
         rows = page.evaluate("""
             () => {
               function findRoot() {
@@ -307,7 +299,6 @@ def fetch_by_playwright() -> List[Product]:
         """)
         context.close(); browser.close()
 
-    # soup로 다시 브랜드 시도 + 로그
     items: List[Product] = []; seen=set(); logs=[]
     for row in rows:
         href = normalize_href(row.get("href",""))
@@ -346,19 +337,16 @@ def fetch_by_playwright() -> List[Product]:
         seen.add(key)
         sale, _, pct = compute_prices(block)
         prod = Product(len(items)+1, brand, name, sale, pct, href, code)
-        items.append(prod)
-        logs.append({**asdict(prod), "src":"desktop"})
-
+        items.append(prod); logs.append({**asdict(prod), "src":"desktop"})
         if len(items) >= MAX_RANK: break
 
     if logs:
-        df = pd.DataFrame(logs)
-        # append or write
         p = os.path.join(DEBUG_DIR, "extract_log.csv")
         if os.path.exists(p):
-            old = pd.read_csv(p)
-            df = pd.concat([old, df], ignore_index=True)
-        df.to_csv(p, index=False, encoding="utf-8-sig")
+            old = pd.read_csv(p); logs = pd.concat([old, pd.DataFrame(logs)], ignore_index=True)
+        else:
+            logs = pd.DataFrame(logs)
+        logs.to_csv(p, index=False, encoding="utf-8-sig")
 
     print(f"[Playwright] {len(items)}개")
     return items
@@ -376,8 +364,10 @@ def fmt_currency(v):
 def slack_post(text):
     url = os.getenv("SLACK_WEBHOOK_URL")
     if not url: print(text); return
-    try: requests.post(url, json={"text": text, "unfurl_links": False, "unfurl_media": False}, timeout=20)
-    except Exception as e: print("[Slack 전송 실패]", e); print(text)
+    try:
+        requests.post(url, json={"text": text, "unfurl_links": False, "unfurl_media": False}, timeout=20)
+    except Exception as e:
+        print("[Slack 전송 실패]", e); print(text)
 
 # -------------------- Translate --------------------
 def translate_ja_to_ko_batch(lines: List[str])->List[str]:
@@ -404,7 +394,7 @@ def to_dataframe(products: List[Product], date_str: str)->pd.DataFrame:
 def _norm_product_code(v)->str:
     if pd.isna(v): return ""
     try:
-        f = float(str(v)); 
+        f = float(str(v))
         if f.is_integer(): return str(int(f))
     except: pass
     return str(v).strip()
@@ -438,8 +428,7 @@ def build_sections(df_today:pd.DataFrame, df_prev:Optional[pd.DataFrame])->Dict[
     def plain_name(r):
         nm = strip_brackets_for_slack(clean_text(r.get("product_name","")))
         br = clean_text(r.get("brand",""))
-        if br and not nm.lower().startswith(br.lower()):
-            nm = f"{br} {nm}"
+        if br and not nm.lower().startswith(br.lower()): nm = f"{br} {nm}"
         return nm
 
     def full_link(r): return f"<{r['url']}|{slack_escape(plain_name(r))}>"
@@ -584,7 +573,7 @@ def main():
             if os.path.exists(local_prev):
                 df_prev=pd.read_csv(local_prev); print("[INFO] 로컬 전일 CSV 사용:", yest_file)
     except Exception as e:
-        print("[WARN] 전일 로딩 실패:", e)
+        print("[WARN] 전일 로딩 실패]:", e)
 
     S=build_sections(df_today,df_prev)
     msg=build_slack_message(date,S)
