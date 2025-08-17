@@ -10,13 +10,6 @@ Slack 포맷:
  TOP 10 (변동 마커 + 번역)
  📉 급하락 (5개만, OUT 포함, 번역)
  🔄 랭크 인&아웃 (개수만)
-
-환경변수(예시)
- SLACK_WEBHOOK_URL=...
- SLACK_TRANSLATE_JA2KO=1                 # 번역 사용 (없으면 번역줄 생략)
- GDRIVE_FOLDER_ID=...                    # 구글 드라이브 폴더
- GOOGLE_SERVICE_ACCOUNT_JSON=...         # (선호) 서비스계정 JSON(문자열 또는 b64)
- 또는 GOOGLE_CLIENT_ID/SECRET/REFRESH_TOKEN  # OAuth 대안
 """
 
 import os, re, io, math, pytz, traceback, urllib.parse, base64, json
@@ -54,6 +47,8 @@ NOISE_TOKENS_RE = re.compile(
     re.I,
 )
 JP_CHAR_RE = re.compile(r"[一-龯ぁ-ゔァ-ヴー々〆ヵヶｦ-ﾟ]")
+ROMAN_HEAD_RE = re.compile(r"^([A-Za-z0-9&.\-+/]+)")
+KATAKANA_HEAD_RE = re.compile(r"^([ァ-ヴーｦ-ﾟ]+)")
 
 def strip_brackets_for_slack(s: str) -> str:
     s = clean_text(BRACKETS_PAT.sub("", s or ""))
@@ -111,6 +106,48 @@ def normalize_href(href: str) -> str:
     if href.startswith("/"):  return "https://www.qoo10.jp" + href
     return href
 
+# ---- 브랜드 추출 ----
+def extract_brand_from_li(li: BeautifulSoup, title: str) -> str:
+    cands = []
+
+    # 명시적 셀렉터들
+    for sel in [
+        ".brand", ".brand-name", ".brandName", ".bd_brand", ".brand_area a", ".brandArea a",
+        "a.brand", ".name__brand", ".goods_brand", ".prd_brand", ".sbj_brand"
+    ]:
+        for el in li.select(sel):
+            t = clean_text(el.get_text(" ", strip=True))
+            if t: cands.append(t)
+
+    # 'brand' 파라미터를 가진 링크
+    for a in li.select("a[href]"):
+        href = (a.get("href") or "").lower()
+        if "brand" in href:
+            t = clean_text(a.get_text(" ", strip=True))
+            if t: cands.append(t)
+
+    # 제목 선두에서 추정 (ROMAN / 카타카나)
+    t0 = clean_text(title or "")
+    m = ROMAN_HEAD_RE.match(t0)
+    if m: cands.append(m.group(1))
+    m2 = KATAKANA_HEAD_RE.match(t0)
+    if m2: cands.append(m2.group(1))
+
+    # 스코어링
+    def bscore(b: str) -> int:
+        low = b.lower()
+        if any(x in low for x in ['wish','shop','ショップ','store','公式','qoo10','ストア','楽天','amazon']): return -1
+        if any(tok in b for tok in ['%','OFF','円']): return -1
+        s = len(b)
+        base = 0
+        if ROMAN_HEAD_RE.match(b): base += 3
+        if re.fullmatch(r"[ァ-ヴーｦ-ﾟ]+", b): base += 3
+        return base + max(0, 20 - abs(10 - s))
+
+    if not cands: return ""
+    best = max(cands, key=bscore)
+    return best if bscore(best) > 0 else ""
+
 def choose_product_title(li: BeautifulSoup, a: BeautifulSoup) -> str:
     cands = []
     tit = a.get("title")
@@ -166,14 +203,18 @@ def parse_mobile_html(html: str) -> List[Product]:
         href = normalize_href(a.get("href",""))
         block = clean_text(li.get_text(" ", strip=True))
         code = extract_goods_code(href, block)
+
         name = choose_product_title(li, a)
-        if is_ad_or_noise(name, href, code):  # 광고/노이즈 필터
+        if is_ad_or_noise(name, href, code):
             continue
+
+        brand = extract_brand_from_li(li, name)
+
         key = code or href
         if key in seen: continue
         seen.add(key)
         sale, _, pct = compute_prices(block)
-        items.append(Product(len(items)+1, "", name, sale, pct, href, code))
+        items.append(Product(len(items)+1, brand, name, sale, pct, href, code))
         if len(items) >= MAX_RANK: break
     return items
 
@@ -215,6 +256,7 @@ def fetch_by_playwright() -> List[Product]:
         page.goto(DESKTOP_URL, wait_until="domcontentloaded", timeout=60_000)
         try: page.wait_for_load_state("networkidle", timeout=25_000)
         except: pass
+
         rows = page.evaluate("""
             () => {
               function findRankingList() {
@@ -237,7 +279,7 @@ def fetch_by_playwright() -> List[Product]:
                 const block = (li.innerText || '').replace(/\\s+/g,' ').trim();
                 const key = href + '|' + name;
                 if (seen.has(key)) continue; seen.add(key);
-                out.push({href, name, block, rank: rank++});
+                out.push({href, name, block, html: li.innerHTML, rank: rank++});
                 if (out.length >= 500) break;
               }
               return out;
@@ -253,20 +295,36 @@ def fetch_by_playwright() -> List[Product]:
         name_raw = clean_text(row.get("name",""))
         name = strip_brackets_for_slack(name_raw)
         code = extract_goods_code(href, block)
+
+        # 브랜드(Playwright 경로에서는 제목 선두 토큰으로 추정)
+        brand = ""
+        m = ROMAN_HEAD_RE.match(name)
+        if m: brand = m.group(1)
+        if not brand:
+            m2 = KATAKANA_HEAD_RE.match(name)
+            if m2: brand = m2.group(1)
+
         if score_title(name) < 0:
             segs = re.split(r"[|•/▶▷›»·・\\-–—]+", block)
             best, best_sc = "", -1
             for s in segs:
                 sc = score_title(s)
                 if sc > best_sc: best_sc, best = sc, clean_text(s)
-            if best: name = best
-        if is_ad_or_noise(name, href, code):  # 광고/노이즈 필터
+            if best: 
+                name = best
+                if not brand:
+                    m = ROMAN_HEAD_RE.match(name); m2 = KATAKANA_HEAD_RE.match(name)
+                    if m: brand = m.group(1)
+                    elif m2: brand = m2.group(1)
+
+        if is_ad_or_noise(name, href, code):
             continue
+
         key = code or href
         if key in seen: continue
         seen.add(key)
         sale, _, pct = compute_prices(block)
-        items.append(Product(len(items)+1,"",name,sale,pct,href,code))
+        items.append(Product(len(items)+1, brand, name, sale, pct, href, code))
         if len(items) >= MAX_RANK: break
     print(f"[Playwright] {len(items)}개")
     return items
@@ -284,14 +342,12 @@ def fmt_currency(v):
 
 def slack_post(text):
     url = os.getenv("SLACK_WEBHOOK_URL")
-    if not url: 
-        print(text)
-        return
+    if not url:
+        print(text); return
     try:
         requests.post(url, json={"text": text, "unfurl_links": False, "unfurl_media": False}, timeout=20)
     except Exception as e:
-        print("[Slack 전송 실패]", e)
-        print(text)
+        print("[Slack 전송 실패]", e); print(text)
 
 # -------------------- Translate --------------------
 def translate_ja_to_ko_batch(lines: List[str])->List[str]:
@@ -423,7 +479,7 @@ def build_sections(df_today:pd.DataFrame, df_prev:Optional[pd.DataFrame])->Dict[
 
 # -------------------- Slack message --------------------
 def build_slack_message(date,S):
-    lines=[f"*🛒 큐텐 재팬 뷰티 랭킹 200 — {date}*","","*TOP 10*"]
+    lines=[f"*🛒 큐텐 재팬 뷰티 랭킹 — {date}*","","*TOP 10*"]
     lines+=S["top10"]; lines+=["","*📉 급하락*"]; lines+=S["falling"] or ["- 해당 없음"]
     lines+=["","*🔄 랭크 인&아웃*", f"{S['inout_count']}개의 제품이 인&아웃 되었습니다."]
     return "\n".join(lines)
