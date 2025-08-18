@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   # 필요하면 주기에 맞춰 켜세요 (예: 매일 09:10 KST = 00:10 UTC)
   # schedule:
-  #   - cron: '0 13 * * *'
+  #   - cron: '11 3 * * *'
 
 concurrency:
   group: qoo10jp-beauty-rank
