@@ -1,10 +1,9 @@
 name: qoo10jp-beauty-rank
 
 on:
+  schedule:
+    - cron: "11 4 * * *" # 매일 KST 11:11 (UTC 05:01)
   workflow_dispatch:
-  # 필요하면 주기에 맞춰 켜세요 (예: 매일 09:10 KST = 00:10 UTC)
-  # schedule:
-  #   - cron: '11 4 * * *'
 
 concurrency:
   group: qoo10jp-beauty-rank
