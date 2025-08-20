@@ -69,7 +69,10 @@ def parse_jpy_amounts(text: str) -> List[int]:
 
 def compute_prices(block_text: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
     """return (sale, orig, pct)  / sale=최소, orig=최대, pct=버림"""
-    amounts = parse_jpy_amounts(block_text)
+    amounts_all = parse_jpy_amounts(block_text)
+    # 🔧 FIX: '무료배송 0円' 등으로 0이 섞이면 sale이 0으로 떨어졌던 문제 방지
+    amounts = [a for a in amounts_all if a > 0]
+
     sale = orig = None
     if amounts:
         sale = min(amounts)
@@ -536,79 +539,6 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
 
     # ---------- 인&아웃 개수 ----------
     S["inout_count"] = len(set(t30.index) - set(p30.index)) + len(out_keys)
-    return S
-
-    # ---- 비교용 키
-    def keyify(df):
-        df = df.copy()
-        df["key"] = df.apply(lambda x: x["product_code"] if (pd.notnull(x.get("product_code")) and str(x.get("product_code")).strip()) else x["url"], axis=1)
-        df.set_index("key", inplace=True)
-        return df
-
-    df_t, df_p = keyify(df_today), keyify(df_prev)
-    t30 = df_t[(df_t["rank"].notna()) & (df_t["rank"] <= 30)].copy()
-    p30 = df_p[(df_p["rank"].notna()) & (df_p["rank"] <= 30)].copy()
-    common = set(t30.index) & set(p30.index)
-    new, out = set(t30.index) - set(p30.index), set(p30.index) - set(t30.index)
-
-    def full_name_link(row):
-        return f"<{row['url']}|{slack_escape(plain_name(row))}>"
-
-    def line_move(name_link, prev_rank, curr_rank):
-        if prev_rank is None and curr_rank is not None: return f"- {name_link} NEW → {curr_rank}위", 99999
-        if curr_rank is None and prev_rank is not None: return f"- {name_link} {prev_rank}위 → OUT", 99999
-        delta = prev_rank - curr_rank
-        if   delta > 0: return f"- {name_link} {prev_rank}위 → {curr_rank}위 (↑{delta})", delta
-        elif delta < 0: return f"- {name_link} {prev_rank}위 → {curr_rank}위 (↓{abs(delta)})", abs(delta)
-        else:           return f"- {name_link} {prev_rank}위 → {curr_rank}위 (변동없음)", 0
-
-    # ---- 급상승
-    rising_pack = []
-    for k in common:
-        pr, cr = int(p30.loc[k,"rank"]), int(t30.loc[k,"rank"])
-        imp = pr - cr
-        if imp > 0:
-            rising_pack.append((imp, cr, pr, slack_escape(str(t30.loc[k].get("product_name",""))),
-                                line_move(full_name_link(t30.loc[k]), pr, cr)[0], plain_name(t30.loc[k])))
-    rising_pack.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
-    rising_lines = [e[4] for e in rising_pack[:3]]
-    rising_jp    = [e[5] for e in rising_pack[:3]]
-    S["rising"] = interleave_with_ko(rising_lines, rising_jp)
-
-    # ---- 뉴랭커
-    newcom = []
-    for k in new:
-        cr = int(t30.loc[k,"rank"])
-        newcom.append((cr, f"- {full_name_link(t30.loc[k])} NEW → {cr}위", plain_name(t30.loc[k])))
-    newcom.sort(key=lambda x: x[0])
-    new_lines = [e[1] for e in newcom[:3]]
-    new_jp    = [e[2] for e in newcom[:3]]
-    S["newcomers"] = interleave_with_ko(new_lines, new_jp)
-
-    # ---- 급하락
-    falling_pack = []
-    for k in common:
-        pr, cr = int(p30.loc[k,"rank"]), int(t30.loc[k,"rank"])
-        drop = cr - pr
-        if drop > 0:
-            falling_pack.append((drop, cr, pr, slack_escape(str(t30.loc[k].get("product_name",""))),
-                                 line_move(full_name_link(t30.loc[k]), pr, cr)[0], plain_name(t30.loc[k])))
-    falling_pack.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
-    falling_lines = [e[4] for e in falling_pack[:5]]
-    falling_jp    = [e[5] for e in falling_pack[:5]]
-    S["falling"] = interleave_with_ko(falling_lines, falling_jp)
-
-    # ---- OUT
-    outs_pack = []
-    for k in sorted(list(out)):
-        pr = int(p30.loc[k,"rank"])
-        outs_pack.append((pr, line_move(full_name_link(p30.loc[k]), pr, None)[0], plain_name(p30.loc[k])))
-    outs_pack.sort(key=lambda x: x[0])
-    outs_lines = [e[1] for e in outs_pack]
-    outs_jp    = [e[2] for e in outs_pack]
-    S["outs"] = interleave_with_ko(outs_lines, outs_jp)
-
-    S["inout_count"] = len(new) + len(out)
     return S
 
 def build_slack_message(date_str: str, S: Dict[str, List[str]]) -> str:
