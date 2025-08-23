@@ -99,7 +99,7 @@ def extract_goods_code(url: str, block_text: str = "") -> str:
     m2 = ITEM_PATH_RE.search(url)
     if m2: return m2.group(1)
     m3 = re.search(r"商品番号\s*[:：]\s*(\d+)", block_text or "")
-    return m3.group(1) if m3 else ""
+    return m3.group(1) if m else ""
 
 # ---------- brand ----------
 def bs_pick_brand(container) -> str:
@@ -376,9 +376,8 @@ def translate_ja_to_ko_batch(lines: List[str]) -> List[str]:
     if not ja_pool:
         return ["" for _ in texts]
 
-    # ---- 번역 백엔드: googletrans → deep-translator(둘 다 구글) ----
+    # ---- 번역 백엔드
     def _translate_batch(src_list: List[str]) -> List[str]:
-        # 1) googletrans
         try:
             from googletrans import Translator
             tr = Translator(service_urls=['translate.googleapis.com'])
@@ -386,7 +385,6 @@ def translate_ja_to_ko_batch(lines: List[str]) -> List[str]:
             return [r.text for r in (res if isinstance(res, list) else [res])]
         except Exception as e1:
             print("[Translate] googletrans 실패:", e1)
-        # 2) deep-translator (Google)
         try:
             from deep_translator import GoogleTranslator as DT
             gt = DT(source='ja', target='ko')
@@ -432,9 +430,8 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     """
     슬랙 메시지 전용 섹션 빌드
     - TOP10: (↑n)/(↓n)/(New) 마커, 각 항목 아래 번역 1줄(옵션)
-    - 급상승/뉴랭커: 제거
-    - 급하락: 전일·당일 Top30 교집합 중 하락 + OUT 포함해 최대 5개, 각 항목 아래 번역 1줄(옵션)
-    - 인&아웃: 개수만
+    - 급하락: **전일·당일 Top200 전체** 교집합 중 하락 + OUT 포함해 최대 5개, 각 항목 아래 번역 1줄(옵션)
+    - 인&아웃: **Top200 기준** 대칭차집합 크기 // 2
     """
     S = {"top10": [], "falling": [], "inout_count": 0}
 
@@ -492,7 +489,7 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     if prev_index is None:
         return S
 
-    # ---------- 급하락 (최대 5개, OUT 포함 보충) ----------
+    # ---------- 급하락 (Top200 기준, OUT 포함) ----------
     cur_index = df_today.copy()
     cur_index["__key__"] = cur_index.apply(
         lambda x: (str(x.get("product_code")).strip() if (pd.notnull(x.get("product_code")) and str(x.get("product_code")).strip()) else str(x.get("url")).strip()),
@@ -500,18 +497,18 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     )
     cur_index.set_index("__key__", inplace=True)
 
-    t30 = cur_index[(cur_index["rank"].notna()) & (cur_index["rank"] <= 30)]
-    p30 = prev_index[(prev_index["rank"].notna()) & (prev_index["rank"] <= 30)]
+    t200 = cur_index[(cur_index["rank"].notna()) & (cur_index["rank"] <= MAX_RANK)]
+    p200 = prev_index[(prev_index["rank"].notna()) & (prev_index["rank"] <= MAX_RANK)]
 
-    common = set(t30.index) & set(p30.index)
-    out_keys = set(p30.index) - set(t30.index)
+    common = set(t200.index) & set(p200.index)
+    out_keys = set(p200.index) - set(t200.index)
 
     movers = []
     for k in common:
-        pr, cr = int(p30.loc[k, "rank"]), int(t30.loc[k, "rank"])
+        pr, cr = int(p200.loc[k, "rank"]), int(t200.loc[k, "rank"])
         drop = cr - pr
-        if drop > 0:
-            row = t30.loc[k]
+        if drop > 0:  # 하락만
+            row = t200.loc[k]
             movers.append((drop, cr, pr, f"- {_link(row)} {pr}위 → {cr}위 (↓{drop})", _plain_name(row)))
 
     # 하락폭 내림차순 → 오늘 순위 → 전일 순위 → 제품명
@@ -524,26 +521,28 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
         chosen_lines.append(txt)
         chosen_jp.append(jpn)
 
-    # OUT 보충
+    # OUT 보충 (전일 1~MAX_RANK 안에 있던 항목이 오늘 OUT)
     if len(chosen_lines) < 5:
-        outs_sorted = sorted(list(out_keys), key=lambda k: int(p30.loc[k, "rank"]))
+        outs_sorted = sorted(list(out_keys), key=lambda k: int(p200.loc[k, "rank"]))
         for k in outs_sorted:
             if len(chosen_lines) >= 5:
                 break
-            row = p30.loc[k]
+            row = p200.loc[k]
             txt = f"- {_link(row)} {int(row['rank'])}위 → OUT"
             chosen_lines.append(txt)
             chosen_jp.append(_plain_name(row))
 
     S["falling"] = _interleave(chosen_lines, chosen_jp)
 
-    # ---------- 인&아웃 개수 ----------
-    S["inout_count"] = len(set(t30.index) - set(p30.index)) + len(out_keys)
+    # ---------- 인&아웃 개수 (Top200 기준, 대칭차집합 // 2) ----------
+    today_keys = set(t200.index)
+    prev_keys  = set(p200.index)
+    S["inout_count"] = len(today_keys ^ prev_keys) // 2
     return S
 
 def build_slack_message(date_str: str, S: Dict[str, List[str]]) -> str:
     lines: List[str] = []
-    lines.append(f"*Qoo10 Japan 뷰티 랭킹 200 — {date_str}*")
+    lines.append(f"*Qoo10 Japan 뷰티 랭킹 {MAX_RANK} — {date_str}*")
     lines.append("")
     lines.append("*TOP 10*")
     lines.extend(S.get("top10") or ["- 데이터 없음"])
