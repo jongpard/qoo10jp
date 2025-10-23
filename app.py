@@ -349,14 +349,13 @@ def translate_ja_to_ko_batch(lines: List[str]) -> List[str]:
         print("[Translate] OFF")
         return ["" for _ in texts]
 
-    # 라인 → [("raw",txt)/("ja",txt)] 세그먼트 분해
     seg_lists: List[Optional[List[Tuple[str, str]]]] = []
     ja_pool: List[str] = []
     ja_run = re.compile(r"[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]+")
 
     for line in texts:
         if not contains_japanese(line):
-            seg_lists.append(None)  # 번역 줄 없음
+            seg_lists.append(None)
             continue
         parts: List[Tuple[str, str]] = []
         last = 0
@@ -367,7 +366,6 @@ def translate_ja_to_ko_batch(lines: List[str]) -> List[str]:
             last = m.end()
         if last < len(line):
             parts.append(("raw", line[last:]))
-
         seg_lists.append(parts)
         for kind, txt in parts:
             if kind == "ja":
@@ -382,7 +380,7 @@ def translate_ja_to_ko_batch(lines: List[str]) -> List[str]:
             from googletrans import Translator
             tr = Translator(service_urls=['translate.googleapis.com'])
             res = tr.translate(src_list, src="ja", dest="ko")
-            return [r.text for r in (res if isinstance(res, list) else [res])]
+            return [getattr(r, "text", "") or "" for r in (res if isinstance(res, list) else [res])]
         except Exception as e1:
             print("[Translate] googletrans 실패:", e1)
         try:
@@ -395,7 +393,7 @@ def translate_ja_to_ko_batch(lines: List[str]) -> List[str]:
 
     ja_translated = _translate_batch(ja_pool)
 
-    # 조립: raw는 그대로, ja는 번역으로 치환
+    # ---- 조립 (None 방지 보강)
     out: List[str] = []
     it = iter(ja_translated)
     for parts in seg_lists:
@@ -404,7 +402,10 @@ def translate_ja_to_ko_batch(lines: List[str]) -> List[str]:
             continue
         buf = []
         for kind, txt in parts:
-            buf.append(txt if kind == "raw" else next(it, ""))
+            val = txt if kind == "raw" else next(it, "")
+            if val is None:
+                val = ""
+            buf.append(str(val))
         out.append("".join(buf))
 
     print(f"[Translate] done (JA-only, google): {sum(1 for x in out if x)} lines")
