@@ -43,12 +43,33 @@ jobs:
           pip install playwright==1.46.0
           pip install beautifulsoup4 lxml requests pandas
           pip install google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2
+          # ✅ Google Drive 업로드에 필수 (google-api-core가 참조)
+          pip install -U packaging
           # 번역 백엔드(둘 중 하나라도 성공하도록 둘 다 설치)
           pip install googletrans==4.0.0rc1 deep-translator
 
       - name: Install Playwright browsers
         run: |
           python -m playwright install --with-deps chromium
+
+      # ✅ 드라이브 업로드 전 빠른 점검 (시크릿 주입/의존성)
+      - name: Preflight check (secrets & imports)
+        run: |
+          python - << 'PY'
+          import os, importlib, sys
+          keys = ["GDRIVE_FOLDER_ID","GOOGLE_CLIENT_ID","GOOGLE_CLIENT_SECRET","GOOGLE_REFRESH_TOKEN","SLACK_WEBHOOK_URL"]
+          print("== Secret presence ==")
+          for k in keys:
+              v = os.getenv(k)
+              print(f"{k:20}:", "SET" if v else "MISSING", "| len =", (len(v) if v else 0))
+          print("\n== Python deps check ==")
+          for m in ["googleapiclient.discovery","google.api_core","packaging.version"]:
+              try:
+                  importlib.import_module(m)
+                  print(m, "OK")
+              except Exception as e:
+                  print(m, "FAIL:", e); sys.exit(1)
+          PY
 
       - name: Run python app.py
         run: |
