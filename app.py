@@ -481,9 +481,9 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
                 marker = "(New) "
         tail = f" (↓{int(r['discount_percent'])}%)" if pd.notnull(r.get("discount_percent")) else ""
         try:
-            price_str = f"₩{int(r.get('price')):,}"
+            price_str = f"￥{int(r.get('price')):,}"
         except Exception:
-            price_str = "₩0"
+            price_str = "￥0"
         lines.append(f"{int(r['rank'])}. {marker}{_link(r)} — {price_str}{tail}")
     S["top10"] = _interleave(lines, jp_rows)
 
