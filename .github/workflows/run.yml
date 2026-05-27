@@ -2,7 +2,7 @@ name: qoo10jp-beauty-rank
 
 on:
   schedule:
-    - cron: "11 4 * * *" # 매일 KST 11:11 (UTC 05:01)
+    - cron: "14 4 * * *" # 매일 KST 11:11 (UTC 05:01)
   workflow_dispatch:
 
 concurrency:
