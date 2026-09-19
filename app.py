@@ -13,7 +13,7 @@ Qoo10 JP Beauty Bestsellers (g=2)
   * 수집 상한: QOO10_MAX_RANK (기본 200)
 """
 
-import os, re, io, math, pytz, traceback
+import os, re, io, math, time, html, pytz, traceback
 import datetime as dt
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
@@ -364,6 +364,7 @@ def _translate_azure(src_list: List[str]) -> Optional[List[str]]:
     region = os.getenv("AZURE_TRANSLATOR_REGION", "").strip()
     endpoint = os.getenv("AZURE_TRANSLATOR_ENDPOINT", "https://api.cognitive.microsofttranslator.com").strip().rstrip("/")
     if not key or not endpoint:
+        print("[Translate] Azure SKIP (AZURE_TRANSLATOR_KEY 없음)")
         return None
 
     try:
@@ -402,6 +403,7 @@ def _translate_google_cloud(src_list: List[str]) -> Optional[List[str]]:
     """Google Cloud Translation Basic(v2) REST. API 키가 없으면 None."""
     api_key = os.getenv("GOOGLE_TRANSLATE_API_KEY", "").strip()
     if not api_key:
+        print("[Translate] Google Cloud SKIP (GOOGLE_TRANSLATE_API_KEY 없음)")
         return None
 
     try:
@@ -428,61 +430,113 @@ def _translate_google_cloud(src_list: List[str]) -> Optional[List[str]]:
         return None
 
 
-def _translate_googletrans(src_list: List[str]) -> Optional[List[str]]:
-    try:
-        from googletrans import Translator
-        tr = Translator(service_urls=["translate.googleapis.com"])
-        out: List[str] = []
-        for chunk in _chunk_list_by_limits(src_list, max_items=30, max_chars=12000):
-            res = tr.translate(chunk, src="ja", dest="ko")
-            res_list = res if isinstance(res, list) else [res]
-            translated = [getattr(x, "text", "") or "" for x in res_list]
-            if len(translated) != len(chunk) or any(not x for x in translated):
-                raise RuntimeError("googletrans 응답 개수/내용 오류")
-            out.extend(translated)
-        return out
-    except Exception as e:
-        print("[Translate] googletrans 실패:", e)
-        return None
-
-
 def _translate_deep_translator(src_list: List[str]) -> Optional[List[str]]:
+    """deep-translator Google backend. translate_batch()로 요청 수를 최소화."""
     try:
         from deep_translator import GoogleTranslator as DT
         gt = DT(source="ja", target="ko")
         out: List[str] = []
-        for text in src_list:
-            val = gt.translate(text) if text else ""
-            if not val:
+        chunks = _chunk_list_by_limits(src_list, max_items=20, max_chars=12000)
+        # Google 공개 엔드포인트에 한꺼번에 너무 많은 요청을 보내지 않도록 분할
+        for idx, chunk in enumerate(chunks):
+            vals = gt.translate_batch(chunk)
+            if not isinstance(vals, list) or len(vals) != len(chunk):
+                raise RuntimeError(
+                    f"deep-translator 응답 개수 불일치: 요청={len(chunk)}, 응답={len(vals) if isinstance(vals, list) else 'non-list'}"
+                )
+            vals = [str(v).strip() if v is not None else "" for v in vals]
+            if any(not v for v in vals):
                 raise RuntimeError("deep-translator 빈 응답")
-            out.append(val)
+            out.extend(vals)
+            # 무료 공개 엔드포인트에 연속 요청을 몰아치지 않음
+            if idx < len(chunks) - 1:
+                time.sleep(0.5)
         return out
     except Exception as e:
-        print("[Translate] deep-translator 실패:", e)
+        print("[Translate] deep-translator(batch) 실패:", e)
+        return None
+
+
+def _mymemory_one(text: str, email: str = "") -> str:
+    """MyMemory REST 1건. API의 q 길이 제한을 고려해 UTF-8 450 bytes 이하로 요청."""
+    endpoint = "https://api.mymemory.translated.net/get"
+    # 제품명은 대체로 짧지만 혹시 긴 경우 의미 단위 손실을 줄이기 위해 앞쪽만 자르는 대신 호출 자체를 실패 처리한다.
+    if len(text.encode("utf-8")) > 450:
+        raise RuntimeError(f"MyMemory q 길이 초과: {len(text.encode('utf-8'))} bytes")
+
+    params = {
+        "q": text,
+        "langpair": "ja|ko",
+        "mt": "1",
+    }
+    # 이메일을 넣으면 MyMemory 무료 한도가 더 높아질 수 있음.
+    # 사용자가 환경변수를 설정한 경우에만 전송.
+    if email:
+        params["de"] = email
+
+    r = requests.get(endpoint, params=params, timeout=20)
+    if r.status_code >= 300:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
+    data = r.json()
+    status = data.get("responseStatus")
+    if status not in (200, "200", None):
+        raise RuntimeError(f"responseStatus={status}")
+    text_out = ((data.get("responseData") or {}).get("translatedText") or "").strip()
+    if not text_out:
+        raise RuntimeError("MyMemory 빈 응답")
+    # HTML entity가 섞여 나오는 경우 정리
+    return html.unescape(text_out)
+
+
+def _translate_mymemory(src_list: List[str]) -> Optional[List[str]]:
+    """MyMemory 무료 REST fallback. 무키 사용 가능하며 호출 사이에 작은 간격을 둔다."""
+    try:
+        email = os.getenv("MYMEMORY_EMAIL", "").strip()
+        out: List[str] = []
+        for i, text in enumerate(src_list):
+            val = ""
+            last_err = None
+            for attempt in range(2):
+                try:
+                    val = _mymemory_one(text, email=email)
+                    break
+                except Exception as e:
+                    last_err = e
+                    if attempt == 0:
+                        time.sleep(1.0)
+            if not val:
+                raise RuntimeError(f"MyMemory 실패 [{text[:40]}]: {last_err}")
+            out.append(val)
+            if i < len(src_list) - 1:
+                time.sleep(0.25)
+        return out
+    except Exception as e:
+        print("[Translate] MyMemory 실패:", e)
         return None
 
 
 def _translate_with_fallback(src_list: List[str]) -> List[str]:
-    """Azure → Google Cloud → googletrans → deep-translator 순으로 폴백."""
+    """Azure → Google Cloud → deep-translator(batch) → MyMemory 순으로 폴백."""
     backends = [
         ("Azure", _translate_azure),
         ("Google Cloud", _translate_google_cloud),
-        ("googletrans", _translate_googletrans),
-        ("deep-translator", _translate_deep_translator),
+        ("deep-translator(batch)", _translate_deep_translator),
+        ("MyMemory", _translate_mymemory),
     ]
 
     last_error = None
     for name, fn in backends:
-        # 설정이 없는 optional backend는 조용히 건너뜀
         try:
             result = fn(src_list)
         except Exception as e:
             print(f"[Translate] {name} 예외:", e)
             result = None
             last_error = e
+
         if result is not None and len(result) == len(src_list) and all(isinstance(x, str) and x.strip() for x in result):
             print(f"[Translate] backend={name} 성공 ({len(result)}개)")
             return result
+
         if result is not None:
             last_error = RuntimeError(f"{name}: 결과 길이/내용 불일치")
 
@@ -498,8 +552,8 @@ def translate_ja_to_ko_batch(lines: List[str]) -> List[str]:
     우선순위:
       1) Azure Translator
       2) Google Cloud Translation
-      3) googletrans
-      4) deep-translator
+      3) deep-translator(batch)
+      4) MyMemory
 
     단, 1/2번은 해당 환경변수가 없으면 자동으로 건너뜀.
     """
