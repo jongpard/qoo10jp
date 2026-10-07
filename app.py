@@ -10,10 +10,11 @@ Qoo10 JP Beauty Bestsellers (g=2)
   * 가격: '...円'에 붙은 금액만 인식(판매수/리뷰수 숫자 배제), sale=최솟값, orig=최댓값
   * Slack: 제품명에서 괄호류([]【】()（）) 내용 제거
   * Slack 모든 섹션 각 항목 아래 1줄 한국어 번역(옵션, SLACK_TRANSLATE_JA2KO=1)
+  * 번역 순서: googletrans -> deep-translator -> MyMemory -> Gemini API(GEMINI_API_KEY)
   * 수집 상한: QOO10_MAX_RANK (기본 200)
 """
 
-import os, re, io, math, time, html, pytz, traceback
+import os, re, io, math, pytz, traceback, json
 import datetime as dt
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
@@ -31,7 +32,6 @@ MOBILE_URLS = [
 ]
 DESKTOP_URL = "https://www.qoo10.jp/gmkt.inc/Bestsellers/?g=2"
 MAX_RANK = int(os.getenv("QOO10_MAX_RANK", "200"))  # 기본 200위까지 수집
-MIN_SUCCESS_RANK = int(os.getenv("QOO10_MIN_SUCCESS_RANK", str(min(MAX_RANK, 50))))  # 이 이상이면 HTTP 결과를 성공으로 간주
 
 # ---------- time/utils ----------
 def now_kst(): return dt.datetime.now(KST)
@@ -69,9 +69,8 @@ def parse_jpy_amounts(text: str) -> List[int]:
     return [int(m.group(1).replace(",", "")) for m in YEN_AMOUNT_RE.finditer(text or "")]
 
 def compute_prices(block_text: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
-    """return (sale, orig, pct)  / sale=최소, orig=최대, pct=버림"""
+    """return (sale, orig, pct) / sale=최소, orig=최대, pct=버림"""
     amounts_all = parse_jpy_amounts(block_text)
-    # 🔧 FIX: '무료배송 0円' 등으로 0이 섞이면 sale이 0으로 떨어졌던 문제 방지
     amounts = [a for a in amounts_all if a > 0]
 
     sale = orig = None
@@ -179,7 +178,7 @@ def fetch_by_http_mobile() -> List[Product]:
             r = requests.get(url, headers=headers, timeout=20)
             r.raise_for_status()
             items = parse_mobile_html(r.text)
-            if len(items) >= MIN_SUCCESS_RANK:
+            if len(items) >= 10:
                 print(f"[HTTP 모바일] {url} → {len(items)}개")
                 return items[:MAX_RANK]
         except Exception as e:
@@ -266,7 +265,7 @@ def fetch_by_playwright() -> List[Product]:
 
 def fetch_products() -> List[Product]:
     items = fetch_by_http_mobile()
-    if len(items) >= MIN_SUCCESS_RANK:
+    if len(items) >= 10:
         return items
     print("[Playwright 폴백 진입]")
     return fetch_by_playwright()
@@ -339,223 +338,11 @@ def slack_post(text: str):
     if r.status_code >= 300:
         print("[Slack 실패]", r.status_code, r.text)
 
-def _chunk_list_by_limits(items: List[str], max_items: int, max_chars: int) -> List[List[str]]:
-    """문자 수/항목 수 제한을 고려해 번역 요청을 안전하게 분할."""
-    chunks: List[List[str]] = []
-    cur: List[str] = []
-    cur_chars = 0
-    for item in items:
-        item = item or ""
-        item_chars = len(item)
-        if cur and (len(cur) >= max_items or cur_chars + item_chars > max_chars):
-            chunks.append(cur)
-            cur = []
-            cur_chars = 0
-        cur.append(item)
-        cur_chars += item_chars
-    if cur:
-        chunks.append(cur)
-    return chunks
-
-
-def _translate_azure(src_list: List[str]) -> Optional[List[str]]:
-    """Azure Translator F0 REST. 설정이 없으면 None."""
-    key = os.getenv("AZURE_TRANSLATOR_KEY", "").strip()
-    region = os.getenv("AZURE_TRANSLATOR_REGION", "").strip()
-    endpoint = os.getenv("AZURE_TRANSLATOR_ENDPOINT", "https://api.cognitive.microsofttranslator.com").strip().rstrip("/")
-    if not key or not endpoint:
-        print("[Translate] Azure SKIP (AZURE_TRANSLATOR_KEY 없음)")
-        return None
-
-    try:
-        out: List[str] = []
-        for chunk in _chunk_list_by_limits(src_list, max_items=50, max_chars=45000):
-            url = f"{endpoint}/translate"
-            params = {"api-version": "3.0", "from": "ja", "to": "ko"}
-            headers = {
-                "Ocp-Apim-Subscription-Key": key,
-                "Content-Type": "application/json; charset=UTF-8",
-            }
-            # regional/multi-service 리소스에서는 Region 헤더가 필요할 수 있음.
-            if region:
-                headers["Ocp-Apim-Subscription-Region"] = region
-
-            body = [{"Text": t} for t in chunk]
-            r = requests.post(url, params=params, headers=headers, json=body, timeout=25)
-            if r.status_code >= 300:
-                raise RuntimeError(f"HTTP {r.status_code}: {r.text[:500]}")
-            data = r.json()
-            if not isinstance(data, list) or len(data) != len(chunk):
-                raise RuntimeError(f"응답 개수 불일치: 요청={len(chunk)}, 응답={len(data) if isinstance(data, list) else 'non-list'}")
-            for obj in data:
-                translations = obj.get("translations") if isinstance(obj, dict) else None
-                text = translations[0].get("text", "") if translations else ""
-                if not text:
-                    raise RuntimeError("Azure 번역 결과가 비어 있음")
-                out.append(text)
-        return out
-    except Exception as e:
-        print("[Translate] Azure 실패:", e)
-        return None
-
-
-def _translate_google_cloud(src_list: List[str]) -> Optional[List[str]]:
-    """Google Cloud Translation Basic(v2) REST. API 키가 없으면 None."""
-    api_key = os.getenv("GOOGLE_TRANSLATE_API_KEY", "").strip()
-    if not api_key:
-        print("[Translate] Google Cloud SKIP (GOOGLE_TRANSLATE_API_KEY 없음)")
-        return None
-
-    try:
-        out: List[str] = []
-        url = "https://translation.googleapis.com/language/translate/v2"
-        for chunk in _chunk_list_by_limits(src_list, max_items=50, max_chars=30000):
-            params = {"key": api_key}
-            body = {"q": chunk, "source": "ja", "target": "ko", "format": "text"}
-            r = requests.post(url, params=params, json=body, timeout=25)
-            if r.status_code >= 300:
-                raise RuntimeError(f"HTTP {r.status_code}: {r.text[:500]}")
-            data = r.json()
-            translations = data.get("data", {}).get("translations", [])
-            if len(translations) != len(chunk):
-                raise RuntimeError(f"응답 개수 불일치: 요청={len(chunk)}, 응답={len(translations)}")
-            for obj in translations:
-                text = obj.get("translatedText", "") if isinstance(obj, dict) else ""
-                if not text:
-                    raise RuntimeError("Google Cloud 번역 결과가 비어 있음")
-                out.append(text)
-        return out
-    except Exception as e:
-        print("[Translate] Google Cloud 실패:", e)
-        return None
-
-
-def _translate_deep_translator(src_list: List[str]) -> Optional[List[str]]:
-    """deep-translator Google backend. translate_batch()로 요청 수를 최소화."""
-    try:
-        from deep_translator import GoogleTranslator as DT
-        gt = DT(source="ja", target="ko")
-        out: List[str] = []
-        chunks = _chunk_list_by_limits(src_list, max_items=20, max_chars=12000)
-        # Google 공개 엔드포인트에 한꺼번에 너무 많은 요청을 보내지 않도록 분할
-        for idx, chunk in enumerate(chunks):
-            vals = gt.translate_batch(chunk)
-            if not isinstance(vals, list) or len(vals) != len(chunk):
-                raise RuntimeError(
-                    f"deep-translator 응답 개수 불일치: 요청={len(chunk)}, 응답={len(vals) if isinstance(vals, list) else 'non-list'}"
-                )
-            vals = [str(v).strip() if v is not None else "" for v in vals]
-            if any(not v for v in vals):
-                raise RuntimeError("deep-translator 빈 응답")
-            out.extend(vals)
-            # 무료 공개 엔드포인트에 연속 요청을 몰아치지 않음
-            if idx < len(chunks) - 1:
-                time.sleep(0.5)
-        return out
-    except Exception as e:
-        print("[Translate] deep-translator(batch) 실패:", e)
-        return None
-
-
-def _mymemory_one(text: str, email: str = "") -> str:
-    """MyMemory REST 1건. API의 q 길이 제한을 고려해 UTF-8 450 bytes 이하로 요청."""
-    endpoint = "https://api.mymemory.translated.net/get"
-    # 제품명은 대체로 짧지만 혹시 긴 경우 의미 단위 손실을 줄이기 위해 앞쪽만 자르는 대신 호출 자체를 실패 처리한다.
-    if len(text.encode("utf-8")) > 450:
-        raise RuntimeError(f"MyMemory q 길이 초과: {len(text.encode('utf-8'))} bytes")
-
-    params = {
-        "q": text,
-        "langpair": "ja|ko",
-        "mt": "1",
-    }
-    # 이메일을 넣으면 MyMemory 무료 한도가 더 높아질 수 있음.
-    # 사용자가 환경변수를 설정한 경우에만 전송.
-    if email:
-        params["de"] = email
-
-    r = requests.get(endpoint, params=params, timeout=20)
-    if r.status_code >= 300:
-        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
-    data = r.json()
-    status = data.get("responseStatus")
-    if status not in (200, "200", None):
-        raise RuntimeError(f"responseStatus={status}")
-    text_out = ((data.get("responseData") or {}).get("translatedText") or "").strip()
-    if not text_out:
-        raise RuntimeError("MyMemory 빈 응답")
-    # HTML entity가 섞여 나오는 경우 정리
-    return html.unescape(text_out)
-
-
-def _translate_mymemory(src_list: List[str]) -> Optional[List[str]]:
-    """MyMemory 무료 REST fallback. 무키 사용 가능하며 호출 사이에 작은 간격을 둔다."""
-    try:
-        email = os.getenv("MYMEMORY_EMAIL", "").strip()
-        out: List[str] = []
-        for i, text in enumerate(src_list):
-            val = ""
-            last_err = None
-            for attempt in range(2):
-                try:
-                    val = _mymemory_one(text, email=email)
-                    break
-                except Exception as e:
-                    last_err = e
-                    if attempt == 0:
-                        time.sleep(1.0)
-            if not val:
-                raise RuntimeError(f"MyMemory 실패 [{text[:40]}]: {last_err}")
-            out.append(val)
-            if i < len(src_list) - 1:
-                time.sleep(0.25)
-        return out
-    except Exception as e:
-        print("[Translate] MyMemory 실패:", e)
-        return None
-
-
-def _translate_with_fallback(src_list: List[str]) -> List[str]:
-    """Azure → Google Cloud → deep-translator(batch) → MyMemory 순으로 폴백."""
-    backends = [
-        ("Azure", _translate_azure),
-        ("Google Cloud", _translate_google_cloud),
-        ("deep-translator(batch)", _translate_deep_translator),
-        ("MyMemory", _translate_mymemory),
-    ]
-
-    last_error = None
-    for name, fn in backends:
-        try:
-            result = fn(src_list)
-        except Exception as e:
-            print(f"[Translate] {name} 예외:", e)
-            result = None
-            last_error = e
-
-        if result is not None and len(result) == len(src_list) and all(isinstance(x, str) and x.strip() for x in result):
-            print(f"[Translate] backend={name} 성공 ({len(result)}개)")
-            return result
-
-        if result is not None:
-            last_error = RuntimeError(f"{name}: 결과 길이/내용 불일치")
-
-    print("[Translate] 모든 백엔드 실패:", last_error)
-    return ["" for _ in src_list]
-
-
 def translate_ja_to_ko_batch(lines: List[str]) -> List[str]:
     """
-    일본어 구간만 번역하고 영어/숫자/기호는 그대로 둠.
+    JA 구간만 번역하고 영어/숫자/기호는 그대로 둠.
     SLACK_TRANSLATE_JA2KO=1 일 때만 동작.
-
-    우선순위:
-      1) Azure Translator
-      2) Google Cloud Translation
-      3) deep-translator(batch)
-      4) MyMemory
-
-    단, 1/2번은 해당 환경변수가 없으면 자동으로 건너뜀.
+    폴백 체인: googletrans -> deep-translator -> MyMemory -> Gemini API (GEMINI_API_KEY)
     """
     flag = os.getenv("SLACK_TRANSLATE_JA2KO", "0").lower() in ("1", "true", "yes")
     texts = [(l or "").strip() for l in lines]
@@ -571,60 +358,117 @@ def translate_ja_to_ko_batch(lines: List[str]) -> List[str]:
         if not contains_japanese(line):
             seg_lists.append(None)
             continue
-
         parts: List[Tuple[str, str]] = []
         last = 0
         for m in ja_run.finditer(line):
             if m.start() > last:
                 parts.append(("raw", line[last:m.start()]))
-            parts.append(("ja", m.group(0)))
+            parts.append(("ja", line[m.start():m.end()]))
             last = m.end()
         if last < len(line):
             parts.append(("raw", line[last:]))
-
         seg_lists.append(parts)
         for kind, txt in parts:
-            if kind == "ja" and txt:
+            if kind == "ja":
                 ja_pool.append(txt)
 
     if not ja_pool:
         return ["" for _ in texts]
 
-    # 같은 일본어 조각의 중복 번역 방지
-    unique_ja: List[str] = []
-    seen = set()
-    for x in ja_pool:
-        if x not in seen:
-            seen.add(x)
-            unique_ja.append(x)
+    # ---- 번역 백엔드
+    def _translate_batch(src_list: List[str]) -> List[str]:
+        # 1) googletrans
+        try:
+            from googletrans import Translator
+            tr = Translator(service_urls=['translate.googleapis.com'])
+            res = tr.translate(src_list, src="ja", dest="ko")
+            translated = [getattr(r, "text", "") or "" for r in (res if isinstance(res, list) else [res])]
+            if any(translated):
+                print(f"[Translate] googletrans 성공 ({sum(1 for x in translated if x)}건)")
+                return translated
+        except Exception as e1:
+            print("[Translate] googletrans 실패:", e1)
 
-    translated_unique = _translate_with_fallback(unique_ja)
-    trans_map = {src: dst for src, dst in zip(unique_ja, translated_unique) if dst}
+        # 2) deep-translator (GoogleTranslator)
+        try:
+            from deep_translator import GoogleTranslator as DT
+            gt = DT(source='ja', target='ko')
+            translated = [gt.translate(t) if t else "" for t in src_list]
+            if any(translated):
+                print(f"[Translate] deep-translator 성공 ({sum(1 for x in translated if x)}건)")
+                return translated
+        except Exception as e2:
+            print("[Translate] deep-translator 실패:", e2)
 
+        # 3) MyMemory
+        try:
+            from deep_translator import MyMemoryTranslator
+            mt = MyMemoryTranslator(source='ja', target='ko')
+            translated = [mt.translate(t[:400]) if t else "" for t in src_list]
+            if any(translated):
+                print(f"[Translate] MyMemory 성공 ({sum(1 for x in translated if x)}건)")
+                return translated
+        except Exception as e3:
+            print("[Translate] MyMemory 실패:", e3)
+
+        # 4) Gemini API 폴백 (GEMINI_API_KEY 환경변수)
+        gemini_key = os.getenv("GEMINI_API_KEY")
+        if gemini_key:
+            try:
+                prompt = (
+                    "다음은 일본 뷰티 상품명에서 추출된 일본어 단어/문구 목록입니다. "
+                    "각 항목을 한국어 공식 표기법에 맞게 자연스럽게 번역해주세요.\n"
+                    "반드시 입력된 개수와 순서가 1:1로 정확히 일치하는 JSON 문자열 배열(List of strings)만 반환하세요. "
+                    "다른 설명이나 코드 펜스 없이 오직 JSON 배열만 응답하세요.\n\n"
+                    f"[입력 목록]\n{json.dumps(src_list, ensure_ascii=False)}"
+                )
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}"
+                resp = requests.post(
+                    url,
+                    headers={"Content-Type": "application/json"},
+                    json={"contents": [{"parts": [{"text": prompt}]}]},
+                    timeout=30
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    res_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    res_text = re.sub(r"^```(?:json)?\s*", "", res_text)
+                    res_text = re.sub(r"\s*```$", "", res_text)
+                    translated = json.loads(res_text)
+                    if isinstance(translated, list) and len(translated) == len(src_list):
+                        print(f"[Translate] Gemini API 성공 ({len(translated)}건)")
+                        return [str(x) if x is not None else "" for x in translated]
+                    else:
+                        print(f"[Translate] Gemini 응답 개수 불일치 (입력:{len(src_list)}, 출력:{len(translated) if isinstance(translated, list) else 0})")
+                else:
+                    print(f"[Translate] Gemini HTTP 오류: {resp.status_code} - {resp.text}")
+            except Exception as e4:
+                print("[Translate] Gemini API 실패:", e4)
+        else:
+            print("[Translate] Gemini SKIP (GEMINI_API_KEY 없음)")
+
+        print("[Translate] 모든 백엔드 실패")
+        return ["" for _ in src_list]
+
+    ja_translated = _translate_batch(ja_pool)
+
+    # ---- 조립
     out: List[str] = []
+    it = iter(ja_translated)
     for parts in seg_lists:
         if parts is None:
             out.append("")
             continue
-        buf: List[str] = []
-        has_translation = False
+        buf = []
         for kind, txt in parts:
-            if kind == "raw":
-                val = txt
-            else:
-                val = trans_map.get(txt, "")
-                if val:
-                    has_translation = True
-                # 번역 실패한 조각은 원문을 버리고 빈 줄로 만드는 대신 원문 유지
-                # → Slack에서 정보가 사라지는 것을 방지
-                if not val:
-                    val = txt
-            buf.append(val)
-        out.append("".join(buf) if has_translation else "")
+            val = txt if kind == "raw" else next(it, "")
+            if val is None:
+                val = ""
+            buf.append(str(val))
+        out.append("".join(buf))
 
-    print(f"[Translate] done (fallback chain, unique JA={len(unique_ja)}, lines={sum(1 for x in out if x)})")
+    print(f"[Translate] done (JA-only): {sum(1 for x in out if x)} lines")
     return out
-# ===== /translate =====
 
 
 # ---------- compare/message ----------
@@ -645,8 +489,8 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     """
     슬랙 메시지 전용 섹션 빌드
     - TOP10: (↑n)/(↓n)/(New) 마커, 각 항목 아래 번역 1줄(옵션)
-    - 급하락: **전일·당일 Top200 전체** 교집합 중 하락 + OUT 포함해 최대 5개, 각 항목 아래 번역 1줄(옵션)
-    - 인&아웃: **Top200 기준** 대칭차집합 크기 // 2
+    - 급하락: 전일·당일 Top200 전체 교집합 중 하락 + OUT 포함해 최대 5개, 각 항목 아래 번역 1줄(옵션)
+    - 인&아웃: Top200 기준 대칭차집합 크기 // 2
     """
     S = {"top10": [], "falling": [], "inout_count": 0}
 
@@ -673,7 +517,6 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     prev_index = None
     if df_prev is not None and len(df_prev):
         prev_index = df_prev.copy()
-        # product_code 우선, 없으면 url 키로 인덱스
         prev_index["__key__"] = prev_index.apply(
             lambda x: (str(x.get("product_code")).strip() if (pd.notnull(x.get("product_code")) and str(x.get("product_code")).strip()) else str(x.get("url")).strip()),
             axis=1
@@ -726,7 +569,6 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
             row = t200.loc[k]
             movers.append((drop, cr, pr, f"- {_link(row)} {pr}위 → {cr}위 (↓{drop})", _plain_name(row)))
 
-    # 하락폭 내림차순 → 오늘 순위 → 전일 순위 → 제품명
     movers.sort(key=lambda x: (-x[0], x[1], x[2], x[4]))
 
     chosen_lines, chosen_jp = [], []
@@ -736,7 +578,7 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
         chosen_lines.append(txt)
         chosen_jp.append(jpn)
 
-    # OUT 보충 (전일 1~MAX_RANK 안에 있던 항목이 오늘 OUT)
+    # OUT 보충
     if len(chosen_lines) < 5:
         outs_sorted = sorted(list(out_keys), key=lambda k: int(p200.loc[k, "rank"]))
         for k in outs_sorted:
@@ -749,7 +591,7 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
 
     S["falling"] = _interleave(chosen_lines, chosen_jp)
 
-    # ---------- 인&아웃 개수 (Top200 기준, 대칭차집합 // 2) ----------
+    # ---------- 인&아웃 개수 ----------
     today_keys = set(t200.index)
     prev_keys  = set(p200.index)
     S["inout_count"] = len(today_keys ^ prev_keys) // 2
@@ -777,7 +619,10 @@ def main():
     file_yesterday = build_filename(ymd_yesterday)
 
     print("수집 시작:", MOBILE_URLS[0])
-    items = fetch_products()
+    items = fetch_by_http_mobile()
+    if len(items) < 10:
+        print("[Playwright 폴백 진입]")
+        items = fetch_by_playwright()
     print("수집 완료:", len(items))
     if len(items) < 10:
         raise RuntimeError("제품 카드가 너무 적게 수집되었습니다. 셀렉터/렌더링 점검 필요")
