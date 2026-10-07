@@ -10,11 +10,18 @@ Qoo10 JP Beauty Bestsellers (g=2)
   * 가격: '...円'에 붙은 금액만 인식(판매수/리뷰수 숫자 배제), sale=최솟값, orig=최댓값
   * Slack: 제품명에서 괄호류([]【】()（）) 내용 제거
   * Slack 모든 섹션 각 항목 아래 1줄 한국어 번역(옵션, SLACK_TRANSLATE_JA2KO=1)
-  * 번역 순서: googletrans -> deep-translator -> MyMemory -> Gemini API(GEMINI_API_KEY)
+  * 번역 엔진: Google GenAI SDK (gemini-2.5-flash 배치 처리)
   * 수집 상한: QOO10_MAX_RANK (기본 200)
 """
 
-import os, re, io, math, pytz, traceback, json
+import os
+import re
+import io
+import time
+import math
+import json
+import pytz
+import traceback
 import datetime as dt
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
@@ -22,6 +29,10 @@ from typing import List, Dict, Optional, Tuple
 import requests
 import pandas as pd
 from bs4 import BeautifulSoup
+
+# Google GenAI 공식 SDK
+from google import genai
+from google.genai import errors
 
 # ---------- Config ----------
 KST = pytz.timezone("Asia/Seoul")
@@ -31,7 +42,7 @@ MOBILE_URLS = [
     "https://www.qoo10.jp/gmkt.inc/mobile/bestsellers/default.aspx?group_code=2",
 ]
 DESKTOP_URL = "https://www.qoo10.jp/gmkt.inc/Bestsellers/?g=2"
-MAX_RANK = int(os.getenv("QOO10_MAX_RANK", "200"))  # 기본 200위까지 수집
+MAX_RANK = int(os.getenv("QOO10_MAX_RANK", "200"))
 
 # ---------- time/utils ----------
 def now_kst(): return dt.datetime.now(KST)
@@ -45,7 +56,7 @@ def slack_escape(s): return s.replace("&","&amp;").replace("<","&lt;").replace("
 OFFICIAL_PAT = re.compile(r"^\s*(公式|公式ショップ|公式ストア)\s*", re.I)
 BRACKETS_PAT = re.compile(r"(\[.*?\]|【.*?】|（.*?）|\(.*?\))")
 
-# ----- 일본어 감지 (번역 시 영어-only는 제외)
+# ----- 일본어 감지
 JP_CHAR_RE = re.compile(r"[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]")
 def contains_japanese(s: str) -> bool:
     return bool(JP_CHAR_RE.search(s or ""))
@@ -65,11 +76,9 @@ YEN_AMOUNT_RE = re.compile(r"(?:¥|)(\d{1,3}(?:,\d{3})+|\d+)\s*円")
 PCT_RE = re.compile(r"(\d+)\s*% ?OFF", re.I)
 
 def parse_jpy_amounts(text: str) -> List[int]:
-    # '円'이 붙은 금액만 추출 → 판매수/리뷰수 숫자 배제
     return [int(m.group(1).replace(",", "")) for m in YEN_AMOUNT_RE.finditer(text or "")]
 
 def compute_prices(block_text: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
-    """return (sale, orig, pct) / sale=최소, orig=최대, pct=버림"""
     amounts_all = parse_jpy_amounts(block_text)
     amounts = [a for a in amounts_all if a > 0]
 
@@ -103,7 +112,6 @@ def extract_goods_code(url: str, block_text: str = "") -> str:
 
 # ---------- brand ----------
 def bs_pick_brand(container) -> str:
-    """컨테이너 내에서 상품 링크가 아닌 첫 a를 브랜드로 추정. '公式'류 제거."""
     if not container: return ""
     for a in container.select("a"):
         href = (a.get("href") or "").lower()
@@ -141,22 +149,18 @@ def parse_mobile_html(html: str) -> List[Product]:
         container = a.find_parent("li") or a.find_parent("div")
         block_text = clean_text(container.get_text(" ", strip=True)) if container else clean_text(a.get_text(" ", strip=True))
 
-        # URL 정규화
         if href.startswith("//"): href = "https:" + href
         elif href.startswith("/"): href = "https://www.qoo10.jp" + href
 
-        # 상품코드/dedup
         code = extract_goods_code(href, block_text)
         key = code or href
         if key in seen: continue
         seen.add(key)
 
-        # 이름/브랜드/가격
         name = remove_official_token(a.get_text(" ", strip=True))
         brand = remove_official_token(bs_pick_brand(container))
         sale, orig, pct = compute_prices(block_text)
 
-        # 연속 랭크
         items.append(Product(
             rank=len(items)+1, brand=brand, title=name,
             price=sale, orig_price=orig, discount_percent=pct,
@@ -217,7 +221,6 @@ def fetch_by_playwright() -> List[Product]:
                 const li = a.closest('li') || a.closest('div');
                 if (!href || !name || !li) continue;
 
-                // 브랜드: 상품 링크가 아닌 첫 a
                 let brand = '';
                 const anchors = Array.from(li.querySelectorAll('a'));
                 for (const b of anchors) {
@@ -325,7 +328,7 @@ def drive_download_csv(service, folder_id: str, name: str) -> Optional[pd.DataFr
     while not done: _, done = dl.next_chunk()
     fh.seek(0); return pd.read_csv(fh)
 
-# ---------- Slack / translate ----------
+# ---------- Slack / Gemini Translate ----------
 def fmt_currency_jpy(v) -> str:
     try: return f"¥{int(round(float(v))):,}"
     except: return "¥0"
@@ -340,144 +343,81 @@ def slack_post(text: str):
 
 def translate_ja_to_ko_batch(lines: List[str]) -> List[str]:
     """
-    JA 구간만 번역하고 영어/숫자/기호는 그대로 둠.
-    SLACK_TRANSLATE_JA2KO=1 일 때만 동작.
-    폴백 체인: googletrans -> deep-translator -> MyMemory -> Gemini API (GEMINI_API_KEY)
+    SLACK_TRANSLATE_JA2KO=1 일 때, Gemini official SDK(google-genai)를 사용하여
+    일본어가 포함된 라인을 일괄 한국어로 번역합니다.
     """
-    flag = os.getenv("SLACK_TRANSLATE_JA2KO", "0").lower() in ("1", "true", "yes")
+    flag = os.getenv("SLACK_TRANSLATE_JA2KO", "1").lower() in ("1", "true", "yes")
     texts = [(l or "").strip() for l in lines]
     if not flag or not texts:
         print("[Translate] OFF")
         return ["" for _ in texts]
 
-    seg_lists: List[Optional[List[Tuple[str, str]]]] = []
-    ja_pool: List[str] = []
-    ja_run = re.compile(r"[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]+")
+    targets_idx = []
+    targets_text = []
+    for idx, text in enumerate(texts):
+        if contains_japanese(text):
+            targets_idx.append(idx)
+            targets_text.append(text)
 
-    for line in texts:
-        if not contains_japanese(line):
-            seg_lists.append(None)
-            continue
-        parts: List[Tuple[str, str]] = []
-        last = 0
-        for m in ja_run.finditer(line):
-            if m.start() > last:
-                parts.append(("raw", line[last:m.start()]))
-            parts.append(("ja", line[m.start():m.end()]))
-            last = m.end()
-        if last < len(line):
-            parts.append(("raw", line[last:]))
-        seg_lists.append(parts)
-        for kind, txt in parts:
-            if kind == "ja":
-                ja_pool.append(txt)
-
-    if not ja_pool:
+    if not targets_text:
         return ["" for _ in texts]
 
-    # ---- 번역 백엔드
-    def _translate_batch(src_list: List[str]) -> List[str]:
-        # 1) googletrans
-        try:
-            from googletrans import Translator
-            tr = Translator(service_urls=['translate.googleapis.com'])
-            res = tr.translate(src_list, src="ja", dest="ko")
-            translated = [getattr(r, "text", "") or "" for r in (res if isinstance(res, list) else [res])]
-            if any(translated):
-                print(f"[Translate] googletrans 성공 ({sum(1 for x in translated if x)}건)")
-                return translated
-        except Exception as e1:
-            print("[Translate] googletrans 실패:", e1)
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        print("[Translate] WARN: GEMINI_API_KEY 환경변수가 없습니다.")
+        return ["" for _ in texts]
 
-        # 2) deep-translator (GoogleTranslator)
-        try:
-            from deep_translator import GoogleTranslator as DT
-            gt = DT(source='ja', target='ko')
-            translated = [gt.translate(t) if t else "" for t in src_list]
-            if any(translated):
-                print(f"[Translate] deep-translator 성공 ({sum(1 for x in translated if x)}건)")
-                return translated
-        except Exception as e2:
-            print("[Translate] deep-translator 실패:", e2)
+    out = ["" for _ in texts]
 
-        # 3) MyMemory
-        try:
-            from deep_translator import MyMemoryTranslator
-            mt = MyMemoryTranslator(source='ja', target='ko')
-            translated = [mt.translate(t[:400]) if t else "" for t in src_list]
-            if any(translated):
-                print(f"[Translate] MyMemory 성공 ({sum(1 for x in translated if x)}건)")
-                return translated
-        except Exception as e3:
-            print("[Translate] MyMemory 실패:", e3)
+    try:
+        client = genai.Client(api_key=api_key)
+        prompt = (
+            "다음은 Qoo10 Japan의 뷰티/화장품 상품명 리스트입니다. "
+            "각 항목을 한국 소비자가 알기 쉬운 자연스러운 한국어 표기법으로 1:1 번역하세요.\n"
+            "결과는 원본 순서와 개수가 정확히 일치하는 JSON 문자열 배열(List of strings)로만 응답하세요.\n"
+            "설명, 주석, 마크다운 코드 블록(```) 등은 일체 포함하지 마세요.\n\n"
+            f"[입력 목록]\n{json.dumps(targets_text, ensure_ascii=False)}"
+        )
 
-        # 4) Gemini API 폴백 (GEMINI_API_KEY 환경변수)
-        gemini_key = os.getenv("GEMINI_API_KEY")
-        if gemini_key:
+        for attempt in range(1, 4):
             try:
-                prompt = (
-                    "다음은 일본 뷰티 상품명에서 추출된 일본어 단어/문구 목록입니다. "
-                    "각 항목을 한국어 공식 표기법에 맞게 자연스럽게 번역해주세요.\n"
-                    "반드시 입력된 개수와 순서가 1:1로 정확히 일치하는 JSON 문자열 배열(List of strings)만 반환하세요. "
-                    "다른 설명이나 코드 펜스 없이 오직 JSON 배열만 응답하세요.\n\n"
-                    f"[입력 목록]\n{json.dumps(src_list, ensure_ascii=False)}"
+                res = client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=prompt
                 )
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}"
-                resp = requests.post(
-                    url,
-                    headers={"Content-Type": "application/json"},
-                    json={"contents": [{"parts": [{"text": prompt}]}]},
-                    timeout=30
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    res_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                if res and res.text:
+                    res_text = res.text.strip()
                     res_text = re.sub(r"^```(?:json)?\s*", "", res_text)
                     res_text = re.sub(r"\s*```$", "", res_text)
-                    translated = json.loads(res_text)
-                    if isinstance(translated, list) and len(translated) == len(src_list):
-                        print(f"[Translate] Gemini API 성공 ({len(translated)}건)")
-                        return [str(x) if x is not None else "" for x in translated]
+                    translated_list = json.loads(res_text)
+                    if isinstance(translated_list, list) and len(translated_list) == len(targets_text):
+                        for i, translated in zip(targets_idx, translated_list):
+                            out[i] = str(translated or "").strip()
+                        print(f"[Translate] Gemini API 성공 ({len(targets_text)}건 번역)")
+                        return out
                     else:
-                        print(f"[Translate] Gemini 응답 개수 불일치 (입력:{len(src_list)}, 출력:{len(translated) if isinstance(translated, list) else 0})")
-                else:
-                    print(f"[Translate] Gemini HTTP 오류: {resp.status_code} - {resp.text}")
-            except Exception as e4:
-                print("[Translate] Gemini API 실패:", e4)
-        else:
-            print("[Translate] Gemini SKIP (GEMINI_API_KEY 없음)")
+                        print(f"[Translate] Gemini 응답 개수 불일치 (시도 {attempt}/3)")
+            except errors.APIError as e:
+                print(f"[Translate] Gemini API 오류 (시도 {attempt}/3): {e}")
+                if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                    time.sleep(2 * attempt)
+            except Exception as e:
+                print(f"[Translate] 파싱/호출 예외 (시도 {attempt}/3): {e}")
+                time.sleep(1)
 
-        print("[Translate] 모든 백엔드 실패")
-        return ["" for _ in src_list]
+    except Exception as e:
+        print("[Translate] Gemini 클라이언트 초기화 실패:", e)
 
-    ja_translated = _translate_batch(ja_pool)
-
-    # ---- 조립
-    out: List[str] = []
-    it = iter(ja_translated)
-    for parts in seg_lists:
-        if parts is None:
-            out.append("")
-            continue
-        buf = []
-        for kind, txt in parts:
-            val = txt if kind == "raw" else next(it, "")
-            if val is None:
-                val = ""
-            buf.append(str(val))
-        out.append("".join(buf))
-
-    print(f"[Translate] done (JA-only): {sum(1 for x in out if x)} lines")
+    print("[Translate] Gemini 번역 실패 (원문 처리)")
     return out
-
 
 # ---------- compare/message ----------
 def to_dataframe(products: List[Product], date_str: str) -> pd.DataFrame:
     return pd.DataFrame([{
         "date": date_str,
         "rank": p.rank,
-        "brand": p.brand,            # '公式' 제거 반영
-        "product_name": p.title,     # '公式' 제거 반영
+        "brand": p.brand,
+        "product_name": p.title,
         "price": p.price,
         "orig_price": p.orig_price,
         "discount_percent": p.discount_percent,
@@ -486,12 +426,6 @@ def to_dataframe(products: List[Product], date_str: str) -> pd.DataFrame:
     } for p in products])
 
 def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> Dict[str, List[str]]:
-    """
-    슬랙 메시지 전용 섹션 빌드
-    - TOP10: (↑n)/(↓n)/(New) 마커, 각 항목 아래 번역 1줄(옵션)
-    - 급하락: 전일·당일 Top200 전체 교집합 중 하락 + OUT 포함해 최대 5개, 각 항목 아래 번역 1줄(옵션)
-    - 인&아웃: Top200 기준 대칭차집합 크기 // 2
-    """
     S = {"top10": [], "falling": [], "inout_count": 0}
 
     def _plain_name(row):
@@ -565,7 +499,7 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     for k in common:
         pr, cr = int(p200.loc[k, "rank"]), int(t200.loc[k, "rank"])
         drop = cr - pr
-        if drop > 0:  # 하락만
+        if drop > 0:
             row = t200.loc[k]
             movers.append((drop, cr, pr, f"- {_link(row)} {pr}위 → {cr}위 (↓{drop})", _plain_name(row)))
 
@@ -578,7 +512,6 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
         chosen_lines.append(txt)
         chosen_jp.append(jpn)
 
-    # OUT 보충
     if len(chosen_lines) < 5:
         outs_sorted = sorted(list(out_keys), key=lambda k: int(p200.loc[k, "rank"]))
         for k in outs_sorted:
@@ -619,10 +552,7 @@ def main():
     file_yesterday = build_filename(ymd_yesterday)
 
     print("수집 시작:", MOBILE_URLS[0])
-    items = fetch_by_http_mobile()
-    if len(items) < 10:
-        print("[Playwright 폴백 진입]")
-        items = fetch_by_playwright()
+    items = fetch_products()
     print("수집 완료:", len(items))
     if len(items) < 10:
         raise RuntimeError("제품 카드가 너무 적게 수집되었습니다. 셀렉터/렌더링 점검 필요")
@@ -657,7 +587,8 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print("[오류 발생]", e); traceback.print_exc()
+        print("[오류 발생]", e)
+        traceback.print_exc()
         try:
             slack_post(f"*큐텐 재팬 뷰티 랭킹 자동화 실패*\n```\n{e}\n```")
         except: pass
