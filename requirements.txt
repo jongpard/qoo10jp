@@ -1,12 +1,25 @@
+# Web Scraping & Automation
 requests
-pandas
 beautifulsoup4
 lxml
+playwright
+fake-useragent
+
+# Data Processing & Storage
+pandas
+openpyxl
 pytz
+
+# AI / Gemini API
+google-genai
+
+# Google Cloud & Workspace API
 google-api-python-client
 google-auth
 google-auth-oauthlib
-playwright
-googletrans==4.0.0-rc1
-deep-translator==1.11.4
+google-auth-httplib2
+
+# Environment & Utilities
+python-dotenv
 packaging>=23.2
+nest-asyncio
