@@ -44,16 +44,13 @@ jobs:
           pip install playwright==1.46.0
           pip install beautifulsoup4 lxml requests pandas
           pip install google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2
-          # ✅ Google Drive 업로드에 필수 (google-api-core가 참조)
           pip install -U packaging
-          # Gemini Official SDK
           pip install google-genai
 
       - name: Install Playwright browsers
         run: |
           python -m playwright install --with-deps chromium
 
-      # ✅ 사전 점검 (Gemini/드라이브 시크릿 및 핵심 패키지 모듈 검사)
       - name: Preflight check (secrets & imports)
         run: |
           python - << 'PY'
